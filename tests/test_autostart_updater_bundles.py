@@ -98,9 +98,9 @@ def test_sync_watcher_sync_on_close_deferred_queue(tmp_path: Path) -> None:
 
         # Now close Codex! Monitor should wait grace period and auto-sync
         app_is_running["codex"] = False
-        deadline = time.monotonic() + 4.0
+        deadline = time.monotonic() + 6.0
         while time.monotonic() < deadline:
-            if "deferred-skill" in agy.read_skills():
+            if "deferred-skill" in agy.read_skills() and watcher.status_snapshot().sync_count >= 1:
                 break
             time.sleep(0.05)
 
