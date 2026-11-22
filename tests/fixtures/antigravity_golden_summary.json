@@ -1,0 +1,7 @@
+{
+  "expected_conv_db_user_version": 1,
+  "expected_idle_status_string": "CASCADE_RUN_STATUS_IDLE",
+  "expected_idle_raw_summary_field5": 1,
+  "expected_raw_summary_required_fields": [1, 2, 3, 4, 5, 7, 10, 15, 16, 17, 22, 28],
+  "expected_hub_pb_entry_subfields": [1, 2]
+}
