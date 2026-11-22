@@ -52,23 +52,23 @@ def test_tui_onboarding_wizard_live_language_and_persistence(sandbox: dict[str, 
             await pilot.pause()
             assert "Шаг 1/4" in str(tui.screen.query_one("#wizard-step-label", Label).render())
 
-            # Advance Steps 1 -> 2 -> 3 -> 4 (draining async mount messages cleanly on each step)
+            # Advance Steps 1 -> 2 -> 3 -> 4 (allow Textual's 200ms Button active-effect timer to clear)
             await pilot.click("#btn-wiz-next")
-            await pilot.pause()
+            await pilot.pause(0.25)
             assert tui.screen.step == 2
             await pilot.click("#btn-wiz-next")
-            await pilot.pause()
+            await pilot.pause(0.25)
             assert tui.screen.step == 3
             # Toggle Patch Mode in Step 3
             await pilot.click("#wiz-toggle-mode")
-            await pilot.pause()
+            await pilot.pause(0.25)
             await pilot.click("#btn-wiz-next")
-            await pilot.pause()
+            await pilot.pause(0.25)
             assert "Шаг 4/4" in str(tui.screen.query_one("#wizard-step-label", Label).render())
 
             # Finish wizard -> persists config.toml
             await pilot.click("#btn-wiz-finish")
-            await pilot.pause()
+            await pilot.pause(0.2)
             assert tui.config.onboarding_completed is True
             assert tui.config.locale == "ru"
             assert tui.config.patch_mode == "auto"
