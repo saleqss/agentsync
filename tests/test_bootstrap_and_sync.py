@@ -160,15 +160,16 @@ def test_strict_idempotency_across_three_consecutive_syncs(sandbox: dict[str, An
 
 
 def test_windows_path_variants_and_junction_dedup(tmp_path: Path) -> None:
-    """Drive casing, slashes, extended prefix, file URI, and NTFS junctions all map to one dedup key."""
+    """Path variants (slashes, trailing slash, dot segments, file URI, symlinks, Windows casing/junctions) deduplicate."""
     real_dir = tmp_path / "CanonicalProject"
     real_dir.mkdir()
 
     k_native = path_dedup_key(str(real_dir))
-    assert k_native == path_dedup_key(str(real_dir).lower())
     assert k_native == path_dedup_key(str(real_dir).replace("\\", "/") + "/")
+    assert k_native == path_dedup_key(f"{real_dir}/.")
 
     if sys.platform == "win32":
+        assert k_native == path_dedup_key(str(real_dir).lower())
         drive_lower = str(real_dir)[0].lower() + str(real_dir)[1:]
         assert k_native == path_dedup_key(drive_lower)
         assert k_native == path_dedup_key(f"\\\\?\\{real_dir}\\")
@@ -187,6 +188,11 @@ def test_windows_path_variants_and_junction_dedup(tmp_path: Path) -> None:
                 assert path_dedup_key(str(junction)) == k_native
             finally:
                 os.rmdir(junction)
+    else:
+        assert k_native == path_dedup_key(f"file://{real_dir}")
+        symlink = tmp_path / "SymlinkAlias"
+        symlink.symlink_to(real_dir, target_is_directory=True)
+        assert path_dedup_key(str(symlink)) == k_native
 
 
 def test_chat_lww_conflict_archives_loser_snapshot(sandbox: dict[str, Any]) -> None:

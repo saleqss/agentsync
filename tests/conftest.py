@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -187,7 +188,7 @@ def sandbox(tmp_path: Path) -> dict[str, object]:
             "legacy_sse_srv": {"url": "https://example.com/sse", "type": "sse"},
         },
         "projects": {
-            str(ws_app).lower(): {"trust_level": "trusted"},
+            (str(ws_app).lower() if sys.platform == "win32" else f"{ws_app}/"): {"trust_level": "trusted"},
             str(ws_docs): {"trust_level": "trusted"},
         },
     }
@@ -307,14 +308,18 @@ def sandbox(tmp_path: Path) -> dict[str, object]:
     )
     sconn.execute(
         "INSERT INTO project_roots(project_id, position, path) VALUES('cx-proj-app-dup2', 0, ?)",
-        (str(ws_app).lower().replace("\\", "/"),),
+        (
+            str(ws_app).lower().replace("\\", "/")
+            if sys.platform == "win32"
+            else f"{ws_app}/.",
+        ),
     )
     sconn.execute(
         "INSERT INTO projects(id, name, metadata, position, created_at_ms, updated_at_ms) VALUES('cx-proj-app-dup3', 'coreapp', '{}', 3, 1200, 4000)"
     )
     sconn.execute(
         "INSERT INTO project_roots(project_id, position, path) VALUES('cx-proj-app-dup3', 0, ?)",
-        (f"\\\\?\\{ws_app}\\" if "\\" in str(ws_app) else str(ws_app) + "/",),
+        (f"\\\\?\\{ws_app}\\" if sys.platform == "win32" else f"{ws_app}/",),
     )
     sconn.execute(
         "INSERT INTO projects(id, name, metadata, position, created_at_ms, updated_at_ms) VALUES('cx-proj-docs-1', 'DocsPortal', '{}', 0, 1500, 1500)"
