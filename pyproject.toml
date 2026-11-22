@@ -79,4 +79,3 @@ ignore = ["E501", "B008"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
-asyncio_default_fixture_loop_scope = "function"

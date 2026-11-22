@@ -44,29 +44,31 @@ def test_tui_onboarding_wizard_live_language_and_persistence(sandbox: dict[str, 
         )
         async with tui.run_test(size=(120, 40)) as pilot:
             await tui.workers.wait_for_complete()
-            await pilot.pause(0.15)
+            await pilot.pause()
             # Wizard should be active on Step 1
             assert tui.screen.__class__.__name__ == "OnboardingModal"
             # Switch language to Russian live inside wizard
             await pilot.click("#wiz-lang-ru")
-            await pilot.pause(0.1)
+            await pilot.pause()
             assert "Шаг 1/4" in str(tui.screen.query_one("#wizard-step-label", Label).render())
 
-            # Advance Steps 1 -> 2 -> 3 -> 4
+            # Advance Steps 1 -> 2 -> 3 -> 4 (draining async mount messages cleanly on each step)
             await pilot.click("#btn-wiz-next")
-            await pilot.pause(0.1)
+            await pilot.pause()
+            assert tui.screen.step == 2
             await pilot.click("#btn-wiz-next")
-            await pilot.pause(0.1)
+            await pilot.pause()
+            assert tui.screen.step == 3
             # Toggle Patch Mode in Step 3
             await pilot.click("#wiz-toggle-mode")
-            await pilot.pause(0.1)
+            await pilot.pause()
             await pilot.click("#btn-wiz-next")
-            await pilot.pause(0.1)
+            await pilot.pause()
             assert "Шаг 4/4" in str(tui.screen.query_one("#wizard-step-label", Label).render())
 
             # Finish wizard -> persists config.toml
             await pilot.click("#btn-wiz-finish")
-            await pilot.pause(0.15)
+            await pilot.pause()
             assert tui.config.onboarding_completed is True
             assert tui.config.locale == "ru"
             assert tui.config.patch_mode == "auto"
