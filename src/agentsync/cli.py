@@ -1,8 +1,9 @@
-"""Typer + Rich CLI for agentsync (100% English)."""
+"""Typer + Rich + Textual CLI entry point for agentsync (100% backward compatible)."""
 
 from __future__ import annotations
 
-import sys
+import json
+import webbrowser
 from collections import Counter
 from pathlib import Path
 
@@ -19,35 +20,41 @@ from agentsync.config import (
     AgentSyncConfig,
     ConfigManager,
     EntityType,
+    PatchMode,
     SyncOptions,
+    SyncScope,
     ToolConfig,
 )
 from agentsync.discovery import discover_tools, merge_discovery_into_config
+from agentsync.engine.board import generate_inventory_board
 from agentsync.engine.bootstrap import BootstrapEngine
 from agentsync.engine.doctor import DoctorEngine
+from agentsync.engine.handoff import HandoffEngine, LaunchMode
+from agentsync.engine.patch import PatchEngine
+from agentsync.engine.skill_export import install_agentsync_skill
 from agentsync.engine.sync import SyncEngine
 from agentsync.engine.watcher import SyncWatcher
+from agentsync.engine.workspace import WorkspaceEngine
+from agentsync.i18n import set_locale
 from agentsync.models.canonical import SyncPlan
 from agentsync.state.backup import BackupManager
+from agentsync.state.ledger import LedgerStore
 from agentsync.state.state_db import StateStore
+from agentsync.utils.env_adapt import detect_environment, enforce_utf8_io
 from agentsync.utils.process_guard import AppsRunningError, detect_running_apps
 from agentsync.utils.secrets import mask_text
 
-# Prevent UnicodeEncodeError on legacy Windows PowerShell 5.1 consoles
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        try:
-            _stream.reconfigure(errors="replace")
-        except Exception:
-            pass
+enforce_utf8_io()
 
 app = typer.Typer(
     name="agentsync",
-    help="Reliable bidirectional synchronization CLI for AI coding agents.",
-    no_args_is_help=True,
+    help="Universal cross-platform synchronization, patching, context-handoff, and TUI suite for AI coding agents.",
+    invoke_without_command=True,
 )
 tools_app = typer.Typer(help="Manage enabled AI tools, paths, and per-tool entity filters.")
+workspace_app = typer.Typer(help="Unified project workspace instruction & shared context synchronization.")
 app.add_typer(tools_app, name="tools")
+app.add_typer(workspace_app, name="workspace")
 console = Console()
 
 _ACTION_COLORS = {
@@ -61,6 +68,12 @@ _ACTION_COLORS = {
     "REPAIR": "bold cyan",
 }
 
+_RISK_COLORS = {
+    "low": "green",
+    "medium": "yellow",
+    "high": "bold red",
+}
+
 
 def _version_callback(value: bool) -> None:
     if value:
@@ -70,6 +83,7 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def _root_callback(
+    ctx: typer.Context,
     version: bool = typer.Option(
         False,
         "--version",
@@ -78,8 +92,31 @@ def _root_callback(
         is_eager=True,
         help="Show agentsync version and exit.",
     ),
+    lang: str | None = typer.Option(
+        None,
+        "--lang",
+        help="Override interface language (en, ru, zh).",
+    ),
+    no_tui: bool = typer.Option(
+        False,
+        "--no-tui",
+        help="Disable interactive TUI launch when invoked without a subcommand.",
+    ),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
     _ = version
+    if lang:
+        set_locale(lang)
+    if ctx.invoked_subcommand is None:
+        env = detect_environment()
+        if not no_tui and env.tui_recommended:
+            from agentsync.tui import launch_tui
+
+            launch_tui(config_path=config_file, data_dir=data_dir, locale_override=lang)
+            raise typer.Exit()
+        console.print(ctx.get_help())
+        raise typer.Exit()
 
 
 def _load_effective_config(
@@ -96,9 +133,13 @@ def _load_effective_config(
     return mgr, cfg
 
 
-def _build_adapters(cfg: AgentSyncConfig) -> list[ToolAdapter]:
+def _build_adapters(cfg: AgentSyncConfig, targets: list[str] | None = None) -> list[ToolAdapter]:
     registry = get_registry()
-    return registry.create_enabled(cfg)
+    adapters = registry.create_enabled(cfg)
+    if targets:
+        allowed = {x.strip() for item in targets for x in item.split(",") if x.strip()}
+        return [a for a in adapters if a.tool_name in allowed]
+    return adapters
 
 
 def _render_plan(plan: SyncPlan, show_all: bool = False) -> None:
@@ -143,7 +184,8 @@ def _render_plan(plan: SyncPlan, show_all: bool = False) -> None:
     detail_table = Table(title="Detailed Diff Report (secrets redacted)", expand=True)
     detail_table.add_column("Category", style="bold", no_wrap=True)
     detail_table.add_column("Action", no_wrap=True)
-    detail_table.add_column("Target", no_wrap=True)
+    detail_table.add_column("Target", overflow="fold", ratio=1)
+    detail_table.add_column("Risk", no_wrap=True)
     detail_table.add_column("Entity", overflow="fold", ratio=1)
     detail_table.add_column("Summary", overflow="fold", ratio=2)
 
@@ -153,10 +195,12 @@ def _render_plan(plan: SyncPlan, show_all: bool = False) -> None:
             skill_bulk.setdefault((act.action, act.target_tool), []).append(act.entity_id)
             continue
         color = _ACTION_COLORS.get(act.action, "white")
+        rcolor = _RISK_COLORS.get(act.risk_level, "white")
         detail_table.add_row(
             act.category,
             f"[{color}]{act.action}[/{color}]",
             act.target_tool,
+            f"[{rcolor}]{act.risk_level}[/{rcolor}]",
             mask_text(act.entity_id),
             mask_text(act.summary),
         )
@@ -170,11 +214,15 @@ def _render_plan(plan: SyncPlan, show_all: bool = False) -> None:
             "skills",
             f"[{color}]{act_kind}[/{color}]",
             target_tool,
+            "[green]low[/green]",
             f"{len(names)} skills",
             preview,
         )
 
     console.print(detail_table)
+
+    if plan.ledger_path:
+        console.print(f"[dim]Apply Ledger: {plan.ledger_path}[/dim]")
 
     if plan.warnings:
         console.print(
@@ -186,6 +234,21 @@ def _render_plan(plan: SyncPlan, show_all: bool = False) -> None:
         )
 
 
+# --- Interactive TUI Launcher ---
+
+
+@app.command("ui")
+def cmd_ui(
+    lang: str | None = typer.Option(None, "--lang", help="Interface language (en, ru, zh)."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Launch the full-featured interactive Terminal UI (TUI)."""
+    from agentsync.tui import launch_tui
+
+    launch_tui(config_path=config_file, data_dir=data_dir, locale_override=lang)
+
+
 # --- Discovery & Tool Management Commands ---
 
 
@@ -194,19 +257,20 @@ def cmd_discover(
     save: bool = typer.Option(False, "--save", help="Persist discovered tools to config.toml."),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
 ) -> None:
-    """Auto-detect installed AI coding tools, storage paths, and capabilities."""
+    """Auto-detect installed desktop, IDE, and CLI AI coding tools, paths, and capabilities."""
     discovered = discover_tools()
     mgr = ConfigManager(config_file)
     existing_cfg = mgr.load()
 
-    tbl = Table(title="Auto-Discovered AI Coding Tools")
-    tbl.add_column("Tool", style="bold")
-    tbl.add_column("Installed")
-    tbl.add_column("Config Status")
-    tbl.add_column("Detected Path", overflow="fold")
-    tbl.add_column("Supported Entities")
+    tbl = Table(title="Auto-Discovered AI Coding Tools", expand=True)
+    tbl.add_column("Tool", style="bold", overflow="fold", ratio=1)
+    tbl.add_column("Type", no_wrap=True)
+    tbl.add_column("Inst", no_wrap=True)
+    tbl.add_column("Status", no_wrap=True)
+    tbl.add_column("Detected Path", overflow="fold", ratio=2)
+    tbl.add_column("Entities", overflow="fold", ratio=1)
 
-    for name, info in sorted(discovered.items()):
+    for name, info in sorted(discovered.items(), key=lambda kv: (not kv[1].installed, kv[0])):
         tcfg = existing_cfg.tools.get(name)
         enabled_str = (
             "[green]enabled[/green]"
@@ -217,6 +281,7 @@ def cmd_discover(
         path_display = (tcfg.path if tcfg and tcfg.path else info.root_path) or "-"
         tbl.add_row(
             f"{info.display_name} ({name})",
+            info.client_kind,
             inst_str,
             enabled_str,
             path_display,
@@ -243,24 +308,26 @@ def cmd_tools_list(
     registry = get_registry()
     discovered = discover_tools()
 
-    tbl = Table(title="Registered AI Tools & Capabilities")
-    tbl.add_column("Tool", style="bold")
-    tbl.add_column("Enabled")
-    tbl.add_column("Path", overflow="fold")
-    tbl.add_column("Configured Entities")
-    tbl.add_column("Adapter Capabilities")
+    tbl = Table(title="Registered AI Tools & Capabilities", expand=True)
+    tbl.add_column("Tool", style="bold", no_wrap=True)
+    tbl.add_column("Type", no_wrap=True)
+    tbl.add_column("Enabled", no_wrap=True)
+    tbl.add_column("Path", overflow="fold", ratio=2)
+    tbl.add_column("Adapter Capabilities", overflow="fold", ratio=1)
 
     for name in registry.list_names():
         cls = registry.get(name)
-        tcfg = cfg.tools.get(name) or ToolConfig(enabled=False, path=discovered.get(name).root_path if name in discovered else None)
+        tcfg = cfg.tools.get(name) or ToolConfig(
+            enabled=False, path=discovered.get(name).root_path if name in discovered else None
+        )
         caps = [e for e in ALL_ENTITIES if cls.capabilities.supports(e)]
         if cls.capabilities.chats and not cls.capabilities.chat_write:
             caps = [f"{c}(ro)" if c == "chats" else c for c in caps]
         tbl.add_row(
             name,
+            cls.client_kind,
             "[green]enabled[/green]" if tcfg.enabled else "[dim]disabled[/dim]",
             tcfg.path or "-",
-            ", ".join(tcfg.entities),
             ", ".join(caps),
         )
     console.print(tbl)
@@ -268,7 +335,7 @@ def cmd_tools_list(
 
 @tools_app.command("enable")
 def cmd_tools_enable(
-    tool: str = typer.Argument(..., help="Tool identifier (e.g., codex, antigravity, claude-code, opencode, deepseek-harness)."),
+    tool: str = typer.Argument(..., help="Tool identifier."),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
 ) -> None:
     """Enable a tool for synchronization."""
@@ -333,7 +400,7 @@ def cmd_tools_set_path(
 @tools_app.command("set-entities")
 def cmd_tools_set_entities(
     tool: str = typer.Argument(..., help="Tool identifier."),
-    entities: str = typer.Argument(..., help="Comma-separated entity list (projects,instructions,skills,mcp,plugins,chats)."),
+    entities: str = typer.Argument(..., help="Comma-separated entity list."),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
 ) -> None:
     """Configure which entity types sync for a specific tool."""
@@ -359,7 +426,208 @@ def cmd_tools_set_entities(
     console.print(f"[green]Updated entities for '{tool}' -> {', '.join(parsed)}[/green]")
 
 
-# --- Operational Commands ---
+# --- Patch, Handoff, Workspace, Board, Skills Commands ---
+
+
+@app.command("patch")
+def cmd_patch(
+    auto: bool = typer.Option(False, "--auto", help="Run in Auto-Patch mode (preflight + backup + repair + sync)."),
+    manual: bool = typer.Option(False, "--manual", help="Run in Manual Patch mode (preview diff before applying)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview patch without modifying disk."),
+    targets: str | None = typer.Option(None, "--targets", help="Comma-separated target tools (others untouched)."),
+    include: list[str] = typer.Option([], "--include", help="Include selector(s), e.g. skills:*,mcp."),
+    exclude: list[str] = typer.Option([], "--exclude", help="Exclude selector(s), e.g. mcp:internal-*."),
+    scope: SyncScope = typer.Option("all", "--scope", help="Sync scope: user, project, or all."),
+    prune: bool = typer.Option(False, "--prune", help="Opt-in mirror mode deleting extras absent from canonical set."),
+    strip_secrets: bool = typer.Option(False, "--strip-secrets", help="Replace literal secrets with env-var placeholders."),
+    force: bool = typer.Option(False, "--force", help="Ignore running application lock guard."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show every individual skill entry."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Auto-Patch or Manual Patch checked/targeted AI apps with backup, repair, sync, and Apply Ledger."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    mode: PatchMode = "auto" if auto else ("manual" if manual else cfg.patch_mode)
+    if targets:
+        selected = [x.strip() for x in targets.split(",") if x.strip()]
+    else:
+        selected = [name for name, tc in cfg.tools.items() if tc.enabled]
+
+    if not selected:
+        console.print("[yellow]No target tools enabled or selected. Run 'agentsync discover' first.[/yellow]")
+        raise typer.Exit(code=1)
+
+    opts = SyncOptions(
+        dry_run=dry_run,
+        force=force,
+        scope=scope,
+        prune=prune,
+        strip_secrets=strip_secrets,
+        strict_vocab_guard=cfg.strict_vocab_guard,
+        skill_link_mode=cfg.skill_link_mode,
+        include=include,
+        exclude=exclude,
+        targets=selected,
+    )
+    engine = PatchEngine(cfg)
+    result = engine.run_patch(
+        selected_tools=selected,
+        mode=mode,
+        dry_run=dry_run,
+        options=opts,
+    )
+    _render_plan(result.sync_plan, show_all=verbose)
+
+
+@app.command("handoff")
+def cmd_handoff(
+    source_tool: str = typer.Option(..., "--from", help="Source tool containing the chat session."),
+    target_tool: str = typer.Option(..., "--to", help="Target tool to receive the conversation + context."),
+    session: str | None = typer.Option(None, "--session", help="Session/chat ID prefix (defaults to latest)."),
+    open_mode: LaunchMode = typer.Option("none", "--open", help="Open target after handoff: none, auto, app, terminal."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview handoff without modifying disk."),
+    force: bool = typer.Option(False, "--force", help="Ignore running app lock guard on target tool."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Transfer a live chat session with project path, rules, and skills to another AI agent with DB verification."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    reg = get_registry()
+    adapters = {
+        name: reg.create(name, tc)
+        for name, tc in cfg.tools.items()
+        if name in reg.list_names() and tc.path
+    }
+    eng = HandoffEngine(cfg, adapters)
+    try:
+        if dry_run:
+            prev = eng.preview(source_tool, target_tool, session_id=session)
+            console.print(
+                Panel(
+                    f"Source: {prev.source_tool} ({prev.session_id})\n"
+                    f"Target: {prev.target_tool}\n"
+                    f"Title: {prev.title}\n"
+                    f"Project: {prev.project_path or '(none)'}\n"
+                    f"Messages: {prev.message_count} | Skills: {prev.active_skills_count} | "
+                    f"Project rules: {'yes' if prev.has_project_instructions else 'no'}\n"
+                    f"Reusable target thread: {prev.reusable_target_id or 'new'}",
+                    title="[yellow]Handoff Preview (DRY-RUN)[/yellow]",
+                )
+            )
+            return
+        res = eng.execute(
+            source_tool,
+            target_tool,
+            session_id=session,
+            open_mode=open_mode,
+            force=force,
+        )
+    except (AppsRunningError, ValueError, RuntimeError) as exc:
+        console.print(f"[bold red]Handoff failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    badge = "[cyan]REUSED EXISTING THREAD[/cyan]" if res.reused_existing else "[green]VERIFIED ON DISK[/green]"
+    console.print(
+        f"{badge}: {res.source_tool} ({res.source_session_id}) -> {res.target_tool} ({res.target_session_id}) "
+        f"[{res.verified_message_count} messages, +{res.synced_skills} skills]"
+    )
+
+
+@workspace_app.command("init")
+def cmd_workspace_init(
+    path: Path = typer.Option(Path("."), "--path", help="Project root directory."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview workspace.yaml creation."),
+) -> None:
+    """Initialize `.agentsync/workspace.yaml` unified workspace manifest."""
+    eng = WorkspaceEngine()
+    manifest, mpath = eng.init_workspace(path.resolve(), dry_run=dry_run)
+    prefix = "[yellow](DRY-RUN)[/yellow] Would create" if dry_run else "[green]Initialized[/green]"
+    console.print(f"{prefix} workspace manifest '{manifest.name}' at {mpath}")
+
+
+@workspace_app.command("sync")
+def cmd_workspace_sync(
+    path: Path = typer.Option(Path("."), "--path", help="Project root directory."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview unified instruction sync."),
+) -> None:
+    """Synchronize AGENTS.md, CLAUDE.md, GEMINI.md, .rules, and Copilot instructions in a workspace."""
+    eng = WorkspaceEngine()
+    res = eng.sync_workspace(path.resolve(), dry_run=dry_run)
+    badge = "[yellow](DRY-RUN)[/yellow]" if dry_run else "[green](APPLIED)[/green]"
+    console.print(
+        f"Workspace sync {badge}: updated={len(res.updated_files)} ({', '.join(res.updated_files) or '-'}), "
+        f"unchanged={len(res.unchanged_files)}"
+    )
+
+
+@app.command("board")
+def cmd_board(
+    output: Path | None = typer.Option(None, "--output", "-o", help="Output HTML file path."),
+    open_browser: bool = typer.Option(False, "--open", help="Open generated board in default browser."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Generate a self-contained offline HTML Visual Inventory Board across all enabled tools."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    adapters = _build_adapters(cfg)
+    out = output or (cfg.resolved_data_dir() / "inventory-board.html")
+    path, count = generate_inventory_board(adapters, out)
+    console.print(f"[green]Generated offline HTML Inventory Board ({count} entities):[/green] {path}")
+    if open_browser:
+        webbrowser.open(path.as_uri())
+
+
+@app.command("list-skills")
+def cmd_list_skills(
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON array."),
+    tool: str | None = typer.Option(None, "--tool", help="Filter by a single tool name."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """List skills discovered across enabled AI tools (scriptable with --json)."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    adapters = _build_adapters(cfg, targets=[tool] if tool else None)
+    rows: list[dict[str, str]] = []
+    for a in adapters:
+        if not a.capabilities.skills:
+            continue
+        for name, sk in sorted(a.read_skills().items()):
+            rows.append(
+                {
+                    "tool": a.tool_name,
+                    "name": name,
+                    "description": sk.description,
+                    "content_hash": sk.content_hash[:12],
+                }
+            )
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    tbl = Table(title=f"Discovered Skills ({len(rows)})", expand=True)
+    tbl.add_column("Tool", style="bold", no_wrap=True)
+    tbl.add_column("Skill", no_wrap=True)
+    tbl.add_column("Hash", no_wrap=True)
+    tbl.add_column("Description", overflow="fold", ratio=2)
+    for r in rows:
+        tbl.add_row(r["tool"], r["name"], r["content_hash"], r["description"])
+    console.print(tbl)
+
+
+@app.command("install-skill")
+def cmd_install_skill(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview which tools would receive agentsync/SKILL.md."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Install the built-in lightweight `agentsync` SKILL.md into enabled AI coding tools."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    adapters = _build_adapters(cfg)
+    installed = install_agentsync_skill(adapters, dry_run=dry_run)
+    prefix = "[yellow](DRY-RUN) Would install[/yellow]" if dry_run else "[green]Installed[/green]"
+    console.print(f"{prefix} agentsync/SKILL.md into {len(installed)} tool(s): {', '.join(installed)}")
+
+
+# --- Original Operational Commands (100% Backward Compatible) ---
 
 
 @app.command("audit")
@@ -419,12 +687,12 @@ def cmd_audit(
 @app.command("doctor")
 def cmd_doctor(
     fix: bool = typer.Option(False, "--fix", help="Quarantine and repair fixable issues automatically."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview repairs without modifying disk (used with --fix)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview repairs without modifying disk."),
     force: bool = typer.Option(False, "--force", help="Ignore running application lock guard when fixing."),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Validate configs, SQLite stores, protobuf indexes, and session JSONL schemas across enabled tools."""
+    """Validate configs, JSONC/TOML syntax, SQLite/protobuf stores, symlinks, and rollout schemas."""
     _, cfg = _load_effective_config(config_file, data_dir)
     adapters = _build_adapters(cfg)
     doc_engine = DoctorEngine(cfg, adapters)
@@ -478,13 +746,13 @@ def cmd_repair(
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Quarantine and regenerate broken rollouts and out-of-sync summary indexes."""
+    """Quarantine and regenerate broken rollouts, symlinks, and out-of-sync summary indexes."""
     cmd_doctor(fix=True, dry_run=dry_run, force=force, config_file=config_file, data_dir=data_dir)
 
 
 @app.command("bootstrap")
 def cmd_bootstrap(
-    source_tool: str = typer.Option(..., "--from", help="Authoritative source tool for initial skills/MCP/plugins migration."),
+    source_tool: str = typer.Option(..., "--from", help="Authoritative source tool for initial migration."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show diff plan without modifying any files."),
     force: bool = typer.Option(False, "--force", help="Ignore running application lock guard."),
     include_subagents: bool = typer.Option(False, "--include-subagents", help="Include subagent chats."),
@@ -492,7 +760,7 @@ def cmd_bootstrap(
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Initial clean migration: backup -> clear target skills/MCP/plugins -> import from source -> merge projects/rules/chats."""
+    """Initial clean migration: backup -> clear target skills/MCP/plugins -> import -> merge projects/rules/chats."""
     _, cfg = _load_effective_config(config_file, data_dir)
     adapters = _build_adapters(cfg)
     options = SyncOptions(dry_run=dry_run, force=force, include_subagents=include_subagents)
@@ -522,14 +790,33 @@ def cmd_sync(
     force: bool = typer.Option(False, "--force", help="Ignore running application lock guard."),
     include_subagents: bool = typer.Option(False, "--include-subagents", help="Include subagent chats."),
     backup: bool = typer.Option(False, "--backup", help="Create a versioned backup before applying changes."),
+    targets: str | None = typer.Option(None, "--targets", help="Comma-separated target tools."),
+    include: list[str] = typer.Option([], "--include", help="Include selectors, e.g. skills:*,mcp."),
+    exclude: list[str] = typer.Option([], "--exclude", help="Exclude selectors, e.g. mcp:internal-*."),
+    scope: SyncScope = typer.Option("all", "--scope", help="Sync scope: user, project, or all."),
+    prune: bool = typer.Option(False, "--prune", help="Opt-in mirror mode deleting extras absent from canonical set."),
+    strip_secrets: bool = typer.Option(False, "--strip-secrets", help="Replace literal secrets with env placeholders."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show every individual skill entry."),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
     """Idempotent bidirectional synchronization across all enabled AI tools."""
     _, cfg = _load_effective_config(config_file, data_dir)
-    adapters = _build_adapters(cfg)
-    options = SyncOptions(dry_run=dry_run, force=force, include_subagents=include_subagents)
+    target_list = [x.strip() for x in targets.split(",") if x.strip()] if targets else []
+    adapters = _build_adapters(cfg, targets=target_list or None)
+    options = SyncOptions(
+        dry_run=dry_run,
+        force=force,
+        include_subagents=include_subagents,
+        scope=scope,
+        prune=prune,
+        strip_secrets=strip_secrets,
+        strict_vocab_guard=cfg.strict_vocab_guard,
+        skill_link_mode=cfg.skill_link_mode,
+        include=include,
+        exclude=exclude,
+        targets=target_list,
+    )
     engine = SyncEngine(cfg, adapters, options=options)
 
     try:
@@ -584,7 +871,7 @@ def cmd_status(
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Show synced entity counts, available backups, recent runs, and conflict history."""
+    """Show synced entity counts, available backups, Apply Ledgers, recent runs, and conflicts."""
     _, cfg = _load_effective_config(config_file, data_dir)
     state = StateStore(cfg.state_db_path, readonly=True)
     try:
@@ -613,6 +900,18 @@ def cmd_status(
         for b in backups[:10]:
             btbl.add_row(b.backup_id, b.created_at_utc, b.reason, ", ".join(b.tools), str(len(b.entries)))
         console.print(btbl)
+
+    ledgers = LedgerStore(cfg).list_apply_ledgers(limit=5)
+    if ledgers:
+        ltbl = Table(title="Recent Apply Ledgers (Per-Item SHA-256)")
+        ltbl.add_column("Timestamp")
+        ltbl.add_column("Mode")
+        ltbl.add_column("Tools")
+        ltbl.add_column("Items", justify="right")
+        ltbl.add_column("Plan Hash")
+        for le in ledgers:
+            ltbl.add_row(le.timestamp_utc[:19], le.mode, ", ".join(le.tools), str(len(le.items)), le.plan_hash[:12])
+        console.print(ltbl)
 
     if runs:
         rtbl = Table(title="Recent Sync Runs")

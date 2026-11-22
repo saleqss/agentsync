@@ -24,6 +24,7 @@ from agentsync.models.canonical import (
     SyncPlan,
 )
 from agentsync.state.backup import BackupManager
+from agentsync.state.ledger import LedgerItem, LedgerStore
 from agentsync.state.state_db import (
     ChatCanonicalRecord,
     ChatLinkRecord,
@@ -32,8 +33,12 @@ from agentsync.state.state_db import (
     StateStore,
     now_ms,
 )
+from agentsync.utils.env_vars import strip_literal_secrets
+from agentsync.utils.events import ProgressBus
 from agentsync.utils.paths import to_native_path
 from agentsync.utils.process_guard import assert_apps_closed
+from agentsync.utils.selectors import SyncSelector
+from agentsync.utils.terminology import scan_strict_vocab
 
 
 class SyncEngine:
@@ -44,15 +49,27 @@ class SyncEngine:
         config: AgentSyncConfig,
         adapters: list[ToolAdapter],
         options: SyncOptions | None = None,
+        bus: ProgressBus | None = None,
     ) -> None:
         self.config = config
-        self.adapters = adapters
-        self.adapters_by_name = {a.tool_name: a for a in adapters}
         self.options = options or SyncOptions(
             include_subagents=config.include_subagents,
             debounce_seconds=config.debounce_seconds,
+            strip_secrets=config.strip_secrets,
+            strict_vocab_guard=config.strict_vocab_guard,
+            skill_link_mode=config.skill_link_mode,
         )
+        # Strictly exclude any adapter not in `options.targets` when targets are explicitly specified
+        if self.options.targets:
+            allowed = set(self.options.targets)
+            self.adapters = [a for a in adapters if a.tool_name in allowed]
+        else:
+            self.adapters = list(adapters)
+        self.adapters_by_name = {a.tool_name: a for a in self.adapters}
+        self.selector = SyncSelector.parse(self.options.include, self.options.exclude)
+        self.bus = bus
         self.backup_mgr = BackupManager(config)
+        self.ledger = LedgerStore(config)
 
     def _active_for(self, entity: EntityType) -> list[ToolAdapter]:
         return [
@@ -80,10 +97,31 @@ class SyncEngine:
 
         state = StateStore(self.config.state_db_path, readonly=is_dry)
         try:
+            def _step(idx: int, cat: str) -> None:
+                if self.bus:
+                    self.bus.check_cancelled()
+                    self.bus.emit(
+                        "sync",
+                        "progress.syncing_category",
+                        step_index=idx,
+                        total_steps=6,
+                        item_name=cat,
+                        category=cat,
+                        step=idx,
+                        total=6,
+                    )
+
             # 1. Projects
-            unified_projects = self._sync_projects(state, plan, dry_run=is_dry)
+            _step(1, "projects")
+            unified_projects = (
+                self._sync_projects(state, plan, dry_run=is_dry)
+                if self.selector.allows_category("projects")
+                else {}
+            )
 
             if create_backup and not is_dry and not plan.is_empty:
+                if self.bus:
+                    self.bus.emit("sync", "progress.backup", step_index=1, total_steps=6)
                 extra_proj_dirs = [
                     Path(to_native_path(p.display_path)) for p in unified_projects.values()
                 ]
@@ -93,21 +131,53 @@ class SyncEngine:
                 plan.backup_id = manifest.backup_id
 
             # 2. Instructions (global + project)
-            self._sync_instructions(state, plan, unified_projects, run_id, dry_run=is_dry)
+            _step(2, "instructions")
+            if self.selector.allows_category("instructions"):
+                self._sync_instructions(state, plan, unified_projects, run_id, dry_run=is_dry)
 
             # 3. Skills
-            self._sync_skills(state, plan, run_id, dry_run=is_dry)
+            _step(3, "skills")
+            if self.options.scope != "project" and self.selector.allows_category("skills"):
+                self._sync_skills(state, plan, run_id, dry_run=is_dry)
 
             # 4. MCP servers
-            self._sync_mcp(state, plan, run_id, dry_run=is_dry)
+            _step(4, "mcp")
+            if self.options.scope != "project" and self.selector.allows_category("mcp"):
+                self._sync_mcp(state, plan, run_id, dry_run=is_dry)
 
             # 5. Plugins
-            self._sync_plugins(state, plan, run_id, dry_run=is_dry)
+            _step(5, "plugins")
+            if self.options.scope != "project" and self.selector.allows_category("plugins"):
+                self._sync_plugins(state, plan, run_id, dry_run=is_dry)
 
             # 6. Chats / sessions
-            self._sync_chats(state, plan, unified_projects, run_id, dry_run=is_dry)
+            _step(6, "chats")
+            if self.options.scope != "project" and self.selector.allows_category("chats"):
+                self._sync_chats(state, plan, unified_projects, run_id, dry_run=is_dry)
 
             if not is_dry and not plan.is_empty:
+                ledger_items = [
+                    LedgerItem(
+                        category=a.category,
+                        target_tool=a.target_tool,
+                        entity_id=a.entity_id,
+                        action=a.action,
+                        risk_level=a.risk_level,
+                        before_sha256=str(a.details.get("before_hash", "")),
+                        after_sha256=str(a.details.get("after_hash", "")),
+                        backup_path=str(self.config.backups_dir / plan.backup_id) if plan.backup_id else "",
+                        summary=a.summary,
+                    )
+                    for a in plan.mutating_actions
+                ]
+                _, lpath = self.ledger.write_apply_ledger(
+                    run_id=run_id,
+                    mode="sync",
+                    tools=[a.tool_name for a in self.adapters],
+                    items=ledger_items,
+                    backup_id=plan.backup_id,
+                )
+                plan.ledger_path = str(lpath)
                 state.record_run(
                     run_id=run_id,
                     mode="sync",
@@ -122,6 +192,8 @@ class SyncEngine:
                         "tools": [a.tool_name for a in self.adapters],
                     },
                 )
+            if self.bus:
+                self.bus.emit("sync", "progress.done", step_index=6, total_steps=6, percent=100.0, level="success")
         finally:
             state.close()
 
@@ -420,9 +492,11 @@ class SyncEngine:
         if len(active) < 2:
             return
 
-        # Global instructions (only tools that support global instruction files; e.g. DSH is project-only)
-        global_tools = [a for a in active if a.tool_name != "deepseek-harness"]
-        if len(global_tools) >= 2:
+        # Global instructions (skipped in --scope project; only tools that support global instruction files)
+        global_tools = [
+            a for a in active if a.tool_name not in {"deepseek-harness", "cline"}
+        ]
+        if self.options.scope != "project" and len(global_tools) >= 2 and self.selector.allows("instructions", "global"):
             self._reconcile_instruction_group(
                 state=state,
                 plan=plan,
@@ -435,14 +509,23 @@ class SyncEngine:
                 dry_run=dry_run,
             )
 
-        # Project instructions (only for existing project dirs that have at least one rule file)
+        # Project instructions (skipped in --scope user)
+        if self.options.scope == "user":
+            return
         for key, proj in sorted(projects.items()):
+            if not self.selector.allows("instructions", proj.name):
+                continue
             pdir = Path(to_native_path(proj.display_path))
             if not pdir.exists() or not pdir.is_dir():
                 continue
             docs = {a.tool_name: a.read_project_instructions(pdir) for a in active}
             if not any(docs.values()):
                 continue
+            if self.options.strict_vocab_guard:
+                for tname, d in docs.items():
+                    if d is not None:
+                        for w in scan_strict_vocab(d.raw_text, target_host=tname):
+                            plan.warnings.append(f"[{proj.name}/{tname}] {w.message}")
             self._reconcile_instruction_group(
                 state=state,
                 plan=plan,
@@ -473,9 +556,28 @@ class SyncEngine:
         all_names = sorted({name for smap in skills_by_tool.values() for name in smap})
 
         for name in all_names:
+            if not self.selector.allows("skills", name):
+                continue
             present = {t: smap[name] for t, smap in skills_by_tool.items() if name in smap}
             stored = state.get_entity_states("skills", name)
             all_tools = [a.tool_name for a in active]
+
+            # Respect opt-in `--prune`: if a previously synced skill was deleted on one tool, propagate deletion
+            if self.options.prune and len(present) < len(all_tools) and len(stored) >= len(all_tools):
+                for a in active:
+                    if a.tool_name in present:
+                        plan.add(
+                            SyncAction(
+                                category="skills",
+                                action="DELETE",
+                                target_tool=a.tool_name,
+                                entity_id=name,
+                                summary=f"Prune skill '{name}' from {a.tool_name} (--prune mirror mode)",
+                            )
+                        )
+                        if not dry_run:
+                            a.delete_skill(name)
+                continue
 
             if len(present) == len(all_tools) and all(
                 t in stored and present[t].content_hash == stored[t].content_hash for t in all_tools
@@ -538,6 +640,20 @@ class SyncEngine:
                 tname = a.tool_name
                 if tname in present and present[tname].content_hash == winner.content_hash:
                     continue
+                # Preserve hand-tuned host-adapted skills instead of clobbering them
+                if tname in present and self.ledger.is_protected_adapted_skill(
+                    name, tname, present[tname].content_hash
+                ):
+                    plan.add(
+                        SyncAction(
+                            category="skills",
+                            action="SKIP",
+                            target_tool=tname,
+                            entity_id=name,
+                            summary=f"Preserve protected host-adapted skill '{name}' in {tname}",
+                        )
+                    )
+                    continue
                 act_kind = "CREATE" if tname not in present else ("CONFLICT" if is_conflict else "UPDATE")
                 plan.add(
                     SyncAction(
@@ -546,6 +662,10 @@ class SyncEngine:
                         target_tool=tname,
                         entity_id=name,
                         summary=f"Update skill '{name}' in {tname} from {winner_tool}",
+                        details={
+                            "before_hash": present[tname].content_hash if tname in present else "",
+                            "after_hash": winner.content_hash,
+                        },
                     )
                 )
                 if not dry_run:
@@ -603,6 +723,8 @@ class SyncEngine:
 
         all_names = sorted({name for mmap in mcps_by_tool.values() for name in mmap})
         for name in all_names:
+            if not self.selector.allows("mcp", name):
+                continue
             # Skip non-portable internal runtime servers (e.g. Codex node_repl)
             non_portable = next(
                 (mmap[name] for mmap in mcps_by_tool.values() if name in mmap and not mmap[name].portable),
@@ -709,7 +831,16 @@ class SyncEngine:
                             backup_path=str(bpath),
                             details="Concurrent MCP edit resolved by updated_at",
                         )
-                    merged_by_tool[tname][name] = winner
+                    if self.options.strip_secrets:
+                        sanitized = winner.model_copy(
+                            update={
+                                "env": strip_literal_secrets(winner.env, prefix=name),
+                                "headers": strip_literal_secrets(winner.headers, prefix=name),
+                            }
+                        ).compute_hash()
+                        merged_by_tool[tname][name] = sanitized
+                    else:
+                        merged_by_tool[tname][name] = winner
                     dirty_tools.add(tname)
 
                 state_updates.append(
