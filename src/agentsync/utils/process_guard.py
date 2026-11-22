@@ -44,15 +44,21 @@ def classify_process(
     if lname in {"codex-windows-sandbox-service.exe", "codex-windows-sandbox-setup.exe"}:
         return None
 
-    # Google Antigravity
+    # Google Antigravity (IDE, Electron helpers, language server, bundled node)
     if lname in {"antigravity.exe", "antigravity"}:
         return "antigravity"
-    if "\\programs\\antigravity\\" in lexe or "/antigravity.app/" in lcmd:
+    if "\\programs\\antigravity\\" in lexe or "/antigravity.app/" in lcmd or "\\antigravity\\bin\\" in lexe:
         return "antigravity"
-    if lname in {"language_server.exe", "language_server"} and "antigravity" in (lexe + " " + lcmd):
+    if lname in {"language_server.exe", "language_server", "language_server_windows_x64.exe"} and "antigravity" in (
+        lexe + " " + lcmd
+    ):
+        return "antigravity"
+    if lname in {"msedgewebview2.exe", "node.exe", "node"} and (
+        "\\antigravity\\" in lexe or "\\antigravity\\" in lcmd or ".antigravity" in lcmd
+    ):
         return "antigravity"
 
-    # OpenAI Codex (WindowsApps MSIX Desktop runs as ChatGPT.exe under OpenAI.Codex_*)
+    # OpenAI Codex (MSIX ChatGPT.exe host, codex.exe, Electron/WebView/runtime/plugin extension-host, WSL CLI)
     if lname in {
         "codex.exe",
         "codex",
@@ -60,13 +66,28 @@ def classify_process(
         "codex-computer-use-swift.exe",
         "codex-code-mode-host.exe",
         "codex-command-runner.exe",
+        "codex-app-server.exe",
     }:
         return "codex"
-    if "\\windowsapps\\openai.codex" in lexe:
+    if "\\windowsapps\\openai.codex" in lexe or "\\windowsapps\\openai.chatgpt" in lexe:
         return "codex"
-    if "\\openai\\codex\\" in lexe or "\\codex-runtimes\\" in lexe:
+    if "\\openai\\codex\\" in lexe or "\\codex-runtimes\\" in lexe or "\\.codex\\" in lexe:
         return "codex"
-    if lname == "chatgpt.exe" and "openai.codex" in (lexe + " " + lcmd):
+    if lname == "chatgpt.exe":
+        return "codex"
+    if lname in {"extension-host.exe", "extension-host"} and (
+        "\\.codex\\" in lexe or "openai-bundled" in lexe or "\\.codex\\" in lcmd
+    ):
+        return "codex"
+    if lname in {"msedgewebview2.exe", "node.exe", "node"} and (
+        "openai.codex" in lexe
+        or "openai.codex" in lcmd
+        or "\\.codex\\" in lexe
+        or "\\.codex\\" in lcmd
+        or "\\openai\\codex\\" in lcmd
+    ):
+        return "codex"
+    if lname in {"wsl.exe", "wslhost.exe"} and "codex" in lcmd:
         return "codex"
 
     # Claude Code

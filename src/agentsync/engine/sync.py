@@ -83,7 +83,7 @@ class SyncEngine:
         dry_run: bool | None = None,
         force: bool | None = None,
         check_processes: bool = True,
-        create_backup: bool = False,
+        create_backup: bool = True,
     ) -> SyncPlan:
         is_dry = self.options.dry_run if dry_run is None else dry_run
         is_force = self.options.force if force is None else force
@@ -91,7 +91,33 @@ class SyncEngine:
         if not is_dry and check_processes:
             assert_apps_closed(force=is_force, check_apps=[a.tool_name for a in self.adapters])
 
-        plan = SyncPlan(mode="sync", dry_run=is_dry)
+        # Pre-check before mutating: skip zero-diff runs cleanly and snapshot BEFORE any disk mutation
+        pre_backup_id: str | None = None
+        if not is_dry and create_backup:
+            preview = self.run(
+                dry_run=True,
+                force=is_force,
+                check_processes=False,
+                create_backup=False,
+            )
+            if preview.is_empty:
+                return preview.model_copy(update={"dry_run": False})
+            has_disk_writes = any(a.action not in ("SKIP", "LINK") for a in preview.actions)
+            if has_disk_writes:
+                if self.bus:
+                    self.bus.emit("sync", "progress.backup", step_index=1, total_steps=6)
+                extra_proj_dirs = [
+                    Path(to_native_path(p.display_path))
+                    for a in self.adapters
+                    if a.capabilities.projects
+                    for p in a.read_projects().values()
+                ]
+                manifest = self.backup_mgr.create_backup(
+                    self.adapters, reason="sync", extra_project_paths=extra_proj_dirs
+                )
+                pre_backup_id = manifest.backup_id
+
+        plan = SyncPlan(mode="sync", dry_run=is_dry, backup_id=pre_backup_id)
         run_id = str(uuid.uuid4())
         started_ms = now_ms()
 
@@ -118,17 +144,6 @@ class SyncEngine:
                 if self.selector.allows_category("projects")
                 else {}
             )
-
-            if create_backup and not is_dry and not plan.is_empty:
-                if self.bus:
-                    self.bus.emit("sync", "progress.backup", step_index=1, total_steps=6)
-                extra_proj_dirs = [
-                    Path(to_native_path(p.display_path)) for p in unified_projects.values()
-                ]
-                manifest = self.backup_mgr.create_backup(
-                    self.adapters, reason="sync", extra_project_paths=extra_proj_dirs
-                )
-                plan.backup_id = manifest.backup_id
 
             # 2. Instructions (global + project)
             _step(2, "instructions")

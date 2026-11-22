@@ -1,18 +1,22 @@
-"""Safety confirmation modal and animated 4-step First-Run Auto-Setup Wizard modal."""
+"""Interactive TUI modals: Confirm, Onboarding Wizard, Diff Viewer, and Update Preview."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Label, ProgressBar, Static
 
 from agentsync.config import PatchMode
 from agentsync.engine.patch import DetectedAppStatus
+from agentsync.engine.updater import UpdateCheckResult
 from agentsync.i18n import LOCALE_LABELS, SUPPORTED_LOCALES, set_locale, t
+from agentsync.models.canonical import SyncAction
+from agentsync.tui.widgets import AgentCheckbox
 
 
 class ConfirmModal(ModalScreen[bool]):
@@ -27,13 +31,83 @@ class ConfirmModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-box"):
             yield Label(self._title, classes="section-title")
-            yield Static(self._body)
-            with Horizontal(classes="btn-row"):
+            yield Static(self._body, markup=False)
+            with Container(classes="action-grid-3"):
                 yield Button(self._confirm_label, id="btn-modal-confirm", variant="success")
                 yield Button(t("modal.cancel"), id="btn-modal-cancel", variant="default")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "btn-modal-confirm")
+
+
+class DiffModal(ModalScreen[None]):
+    """Interactive Diff & Action Inspector modal opened when selecting a row in Patch Diff table."""
+
+    def __init__(self, action: SyncAction) -> None:
+        super().__init__()
+        self._action = action
+
+    def compose(self) -> ComposeResult:
+        act = self._action
+        details_pretty = (
+            json.dumps(act.details, indent=2, ensure_ascii=False)
+            if act.details
+            else "(no additional metadata)"
+        )
+        before_h = act.details.get("before_hash", "-")
+        after_h = act.details.get("after_hash", "-")
+        body_lines = [
+            f"Category : {act.category}",
+            f"Action   : {act.action}",
+            f"Target   : {act.target_tool}",
+            f"Risk     : {act.risk_level.upper()}",
+            f"Entity   : {act.entity_id}",
+            f"Summary  : {act.summary}",
+            "",
+            f"Before SHA-256 : {before_h}",
+            f"After  SHA-256 : {after_h}",
+            "",
+            "--- Details (secrets redacted) ---",
+            details_pretty,
+        ]
+        with Vertical(id="diff-box"):
+            yield Label(t("modal.diff_title"), classes="section-title")
+            with VerticalScroll(id="diff-scroll"):
+                yield Static("\n".join(body_lines), id="diff-body", markup=False)
+            with Horizontal(classes="btn-row"):
+                yield Button(t("modal.close"), id="btn-diff-close", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-diff-close":
+            self.dismiss(None)
+
+
+class UpdateModal(ModalScreen[bool]):
+    """Modal displaying release details and asking to confirm in-place self-update."""
+
+    def __init__(self, info: UpdateCheckResult) -> None:
+        super().__init__()
+        self._info = info
+
+    def compose(self) -> ComposeResult:
+        notes = self._info.release_notes.strip() or "See GitHub Releases for full changelog."
+        body = (
+            f"Current version : v{self._info.current_version}\n"
+            f"Latest version  : v{self._info.latest_version}\n"
+            f"Install method  : {self._info.install_method}\n"
+            f"Release URL     : {self._info.release_url}\n\n"
+            f"{notes}"
+        )
+        with Vertical(id="modal-box"):
+            yield Label(t("modal.update_title"), classes="section-title")
+            with VerticalScroll(id="diff-scroll"):
+                yield Static(body, markup=False)
+            with Container(classes="action-grid-3"):
+                yield Button(t("modal.update_confirm"), id="btn-upd-confirm", variant="success")
+                yield Button(t("modal.cancel"), id="btn-upd-cancel", variant="default")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "btn-upd-confirm")
 
 
 class OnboardingModal(ModalScreen[dict[str, Any]]):
@@ -44,6 +118,7 @@ class OnboardingModal(ModalScreen[dict[str, Any]]):
         initial_apps: list[DetectedAppStatus],
         initial_locale: str = "en",
         initial_patch_mode: PatchMode = "manual",
+        ascii_mode: bool = False,
         on_locale_changed: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
@@ -51,6 +126,7 @@ class OnboardingModal(ModalScreen[dict[str, Any]]):
         self.apps = list(initial_apps)
         self.selected_locale = initial_locale
         self.selected_patch_mode: PatchMode = initial_patch_mode
+        self.ascii_mode = ascii_mode
         self.selected_tools: set[str] = {a.tool_name for a in self.apps if a.installed}
         self._on_locale_changed = on_locale_changed
 
@@ -61,7 +137,7 @@ class OnboardingModal(ModalScreen[dict[str, Any]]):
             yield ProgressBar(total=4, show_eta=False, id="wizard-progress")
             with VerticalScroll(id="wizard-body"):
                 yield Static("", id="wizard-info")
-            with Horizontal(id="wizard-nav", classes="btn-row"):
+            with Container(id="wizard-nav", classes="action-grid"):
                 yield Button(t("wizard.skip"), id="btn-wiz-skip", variant="default")
                 yield Button(t("wizard.back"), id="btn-wiz-back", variant="default")
                 yield Button(t("wizard.next"), id="btn-wiz-next", variant="primary")
@@ -92,7 +168,9 @@ class OnboardingModal(ModalScreen[dict[str, Any]]):
         if self.step == 1:
             for code in SUPPORTED_LOCALES:
                 variant = "success" if code == self.selected_locale else "default"
-                marker = "●" if code == self.selected_locale else "○"
+                marker = "*" if self.ascii_mode else ("●" if code == self.selected_locale else "○")
+                if self.ascii_mode:
+                    marker = "[*]" if code == self.selected_locale else "[ ]"
                 await body.mount(
                     Button(
                         f"{marker} {LOCALE_LABELS[code]} ({code.upper()})",
@@ -124,9 +202,10 @@ class OnboardingModal(ModalScreen[dict[str, Any]]):
             for app_st in self.apps:
                 if not app_st.installed:
                     continue
-                cb = Checkbox(
+                cb = AgentCheckbox(
                     f"{app_st.display_name} ({app_st.client_kind}) - {app_st.root_path}",
                     value=app_st.tool_name in self.selected_tools,
+                    ascii_mode=self.ascii_mode,
                     id=f"wiz-chk-{app_st.tool_name}",
                 )
                 await body.mount(cb)

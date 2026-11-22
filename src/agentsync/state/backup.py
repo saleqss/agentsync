@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -15,8 +16,11 @@ from agentsync.config import AgentSyncConfig
 from agentsync.utils.atomic_io import (
     atomic_write_bytes,
     atomic_write_json,
+    remove_tree_if_exists,
     sha256_file,
     sqlite_backup_file,
+    sqlite_integrity_check,
+    sqlite_restore_from_snapshot,
 )
 from agentsync.utils.process_guard import assert_apps_closed
 
@@ -48,6 +52,15 @@ class RestoreResult(BaseModel):
     restored_files: int = 0
     removed_files: int = 0
     warnings: list[str] = Field(default_factory=list)
+
+
+class BackupVerificationReport(BaseModel):
+    backup_id: str
+    ok: bool = True
+    checked_files: int = 0
+    checked_sqlite: int = 0
+    total_bytes: int = 0
+    errors: list[str] = Field(default_factory=list)
 
 
 class BackupManager:
@@ -150,7 +163,117 @@ class BackupManager:
             tracked_dir_files=tracked_dir_files,
         )
         atomic_write_json(backup_root / "manifest.json", manifest.model_dump(), BackupManifest)
+        self.prune_old_backups()
         return manifest
+
+    def prune_old_backups(
+        self,
+        max_backups: int | None = None,
+        max_days: int | None = None,
+    ) -> list[str]:
+        """Enforce backup retention policy by count and age (always keeps at least the newest backup)."""
+        limit_count = max(1, max_backups if max_backups is not None else self.config.max_backups)
+        limit_days = max(1, max_days if max_days is not None else self.config.max_backup_days)
+        manifests = self.list_backups()
+        if len(manifests) <= 1:
+            return []
+
+        cutoff = datetime.now(UTC) - timedelta(days=limit_days)
+        removed: list[str] = []
+        for idx, mf in enumerate(manifests):
+            if idx == 0:
+                continue  # Never prune the single newest snapshot
+            too_many = idx >= limit_count
+            too_old = False
+            try:
+                created_dt = datetime.fromisoformat(mf.created_at_utc.replace("Z", "+00:00"))
+                if created_dt < cutoff:
+                    too_old = True
+            except Exception:
+                pass
+            if too_many or too_old:
+                bdir = self.config.backups_dir / mf.backup_id
+                if remove_tree_if_exists(bdir):
+                    removed.append(mf.backup_id)
+        return removed
+
+    def verify_backup(self, backup_id: str) -> BackupVerificationReport:
+        """Verify SHA-256 digests for all entries and PRAGMA integrity_check for all SQLite snapshots."""
+        report = BackupVerificationReport(backup_id=backup_id)
+        backup_root = self.config.backups_dir / backup_id
+        manifest_path = backup_root / "manifest.json"
+        if not manifest_path.exists():
+            report.ok = False
+            report.errors.append(f"Missing manifest.json at {backup_root}")
+            return report
+
+        try:
+            manifest = BackupManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            report.ok = False
+            report.errors.append(f"Invalid manifest JSON: {exc}")
+            return report
+
+        for entry in manifest.entries:
+            src = backup_root / entry.backup_rel_path
+            if not src.exists():
+                report.ok = False
+                report.errors.append(f"Missing payload: {entry.backup_rel_path}")
+                continue
+            actual = sha256_file(src)
+            report.checked_files += 1
+            report.total_bytes += src.stat().st_size
+            if actual != entry.sha256:
+                report.ok = False
+                report.errors.append(
+                    f"SHA-256 mismatch for {entry.backup_rel_path} ({Path(entry.original_path).name})"
+                )
+                continue
+            if entry.kind == "sqlite":
+                report.checked_sqlite += 1
+                ok_db, msg_db = sqlite_integrity_check(src, readonly=True)
+                if not ok_db:
+                    report.ok = False
+                    report.errors.append(
+                        f"SQLite integrity_check failed for {Path(entry.original_path).name}: {msg_db}"
+                    )
+        return report
+
+    def verify_all_backups(self) -> list[BackupVerificationReport]:
+        """Verify every stored backup snapshot and return per-backup reports."""
+        return [self.verify_backup(mf.backup_id) for mf in self.list_backups()]
+
+    def total_backup_bytes(self) -> int:
+        """Return total disk footprint in bytes across all stored backups."""
+        if not self.config.backups_dir.exists():
+            return 0
+        return sum(p.stat().st_size for p in self.config.backups_dir.rglob("*") if p.is_file())
+
+    def find_latest_valid_file_in_backups(
+        self,
+        original_path: Path,
+        validator: Callable[[bytes], bool] | None = None,
+    ) -> tuple[str, Path] | None:
+        """Locate the most recent SHA-256 verified backup payload for `original_path` that passes `validator`."""
+        target_norm = os.path.normcase(os.path.abspath(str(original_path)))
+        for mf in self.list_backups():
+            backup_root = self.config.backups_dir / mf.backup_id
+            for entry in mf.entries:
+                if os.path.normcase(os.path.abspath(entry.original_path)) != target_norm:
+                    continue
+                src = backup_root / entry.backup_rel_path
+                if not src.exists():
+                    continue
+                if sha256_file(src) != entry.sha256:
+                    continue
+                if validator is not None:
+                    try:
+                        if not validator(src.read_bytes()):
+                            continue
+                    except Exception:
+                        continue
+                return mf.backup_id, src
+        return None
 
     def list_backups(self) -> list[BackupManifest]:
         if not self.config.backups_dir.exists():
@@ -243,16 +366,14 @@ class BackupManager:
                 except OSError:
                     pass
 
-        # Phase 3: Atomically restore every backed-up file
+        # Phase 3: Atomically restore every backed-up file (with WAL/SHM cleanup + integrity verify for SQLite)
         for entry in manifest.entries:
             src = backup_root / entry.backup_rel_path
             dst = Path(entry.original_path)
             if entry.kind == "sqlite":
-                for suf in ("-wal", "-shm", "-journal"):
-                    sc = Path(str(dst) + suf)
-                    if sc.exists():
-                        sc.unlink()
-            atomic_write_bytes(dst, src.read_bytes())
+                sqlite_restore_from_snapshot(src, dst)
+            else:
+                atomic_write_bytes(dst, src.read_bytes())
             result.restored_files += 1
 
         return result

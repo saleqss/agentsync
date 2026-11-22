@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="360" viewBox="0 0 900 360" role="img" aria-label="AgentSync CLI and Sync-on-Close Walkthrough">
+  <style>
+    .line { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; opacity: 0; animation: fadeIn 0.4s forwards; }
+    .l1 { animation-delay: 0.2s; } .l2 { animation-delay: 0.8s; } .l3 { animation-delay: 1.4s; }
+    .l4 { animation-delay: 2.0s; } .l5 { animation-delay: 2.6s; } .l6 { animation-delay: 3.2s; }
+    .l7 { animation-delay: 3.8s; } .l8 { animation-delay: 4.4s; } .l9 { animation-delay: 5.0s; }
+    @keyframes fadeIn { to { opacity: 1; } }
+  </style>
+  <rect width="900" height="360" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+  <rect width="900" height="34" rx="12" fill="#161b22"/>
+  <circle cx="22" cy="17" r="5" fill="#f85149"/>
+  <circle cx="40" cy="17" r="5" fill="#d29922"/>
+  <circle cx="58" cy="17" r="5" fill="#3fb950"/>
+  <text x="450" y="22" text-anchor="middle" font-family="ui-monospace, Consolas, monospace" font-size="13" fill="#8b949e">agentsync v0.4.0 - Safe Sync-on-Close &amp; Deep Repair</text>
+
+  <text x="24" y="68" class="line l1" fill="#79c0ff">$ agentsync doctor</text>
+  <text x="24" y="94" class="line l2" fill="#3fb950">[OK] codex.db / state_5.sqlite / thread_history_1.sqlite - PRAGMA integrity_check: ok</text>
+  <text x="24" y="120" class="line l3" fill="#e3b341">[WARN] 2 legacy Codex rollouts missing hydration events (auto-fixable)</text>
+  <text x="24" y="154" class="line l4" fill="#79c0ff">$ agentsync patch --manual --dry-run</text>
+  <text x="24" y="180" class="line l5" fill="#c9d1d9">  CREATE  skills   antigravity  systematic-debugging, tdd-workflow</text>
+  <text x="24" y="206" class="line l6" fill="#c9d1d9">  CREATE  mcp      antigravity  github (stdio), postgres-ro (http, ${PG_MCP_TOKEN})</text>
+  <text x="24" y="232" class="line l7" fill="#c9d1d9">  REPAIR  chats    codex        Rebuild 2 rollouts + SQLite offsets + local_thread_catalog</text>
+  <text x="24" y="266" class="line l8" fill="#79c0ff">$ agentsync autostart enable</text>
+  <text x="24" y="292" class="line l9" fill="#3fb950">[OK] Registered hidden logon task 'AgentSyncDaemon' (Sync-on-Close + auto SHA-256 backups)</text>
+  <text x="24" y="330" font-family="ui-monospace, Consolas, monospace" font-size="12" fill="#8b949e">Zero silent writes | Zero secrets leaked | Rollback-safe SQLite transactions</text>
+</svg>

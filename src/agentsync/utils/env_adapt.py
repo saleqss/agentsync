@@ -36,6 +36,7 @@ class EnvironmentProfile(BaseModel):
     rows: int
     no_color: bool
     utf8_capable: bool
+    legacy_console: bool = False
     tui_recommended: bool
 
     def badge(self) -> str:
@@ -45,9 +46,23 @@ class EnvironmentProfile(BaseModel):
             extras.append("SSH")
         if self.is_docker:
             extras.append("Docker")
+        if self.legacy_console:
+            extras.append("conhost")
         if extras:
             return f"{env}/{'+'.join(extras)} ({self.shell})"
         return f"{env} ({self.shell})"
+
+
+def is_legacy_windows_console(env_vars: dict[str, str] | None = None, platform_name: str | None = None) -> bool:
+    """Return True when running inside legacy Windows conhost.exe (PowerShell 5.1 / cmd.exe without Windows Terminal)."""
+    plat = platform_name if platform_name is not None else sys.platform
+    if plat != "win32":
+        return False
+    env = env_vars if env_vars is not None else dict(os.environ)
+    if env.get("AGENTSYNC_ASCII") in ("1", "true", "yes"):
+        return True
+    modern_markers = ("WT_SESSION", "TERM_PROGRAM", "ConEmuPID", "ANSICON", "ALACRITTY_LOG", "WEZTERM_PANE")
+    return not any(env.get(k) for k in modern_markers)
 
 
 def enforce_utf8_io() -> None:
@@ -129,7 +144,8 @@ def detect_environment() -> EnvironmentProfile:
     term_size = shutil.get_terminal_size(fallback=(80, 24))
     no_color = bool(os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb")
     enc = (getattr(sys.stdout, "encoding", None) or "").lower()
-    utf8 = "utf" in enc or is_mac or is_lin or bool(os.environ.get("WT_SESSION"))
+    legacy_con = is_legacy_windows_console()
+    utf8 = ("utf" in enc or is_mac or is_lin or bool(os.environ.get("WT_SESSION"))) and not legacy_con
 
     tui_ok = is_tty and not ci and os.environ.get("TERM") != "dumb" and term_size.columns >= 60 and term_size.lines >= 18
 
@@ -149,6 +165,7 @@ def detect_environment() -> EnvironmentProfile:
         rows=term_size.lines,
         no_color=no_color,
         utf8_capable=utf8,
+        legacy_console=legacy_con,
         tui_recommended=tui_ok,
     )
 

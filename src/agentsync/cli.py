@@ -26,13 +26,17 @@ from agentsync.config import (
     ToolConfig,
 )
 from agentsync.discovery import discover_tools, merge_discovery_into_config
+from agentsync.engine.autostart import autostart_status, disable_autostart, enable_autostart
 from agentsync.engine.board import generate_inventory_board
 from agentsync.engine.bootstrap import BootstrapEngine
+from agentsync.engine.bundle import export_profile_bundle, import_profile_bundle
 from agentsync.engine.doctor import DoctorEngine
 from agentsync.engine.handoff import HandoffEngine, LaunchMode
 from agentsync.engine.patch import PatchEngine
 from agentsync.engine.skill_export import install_agentsync_skill
+from agentsync.engine.support import create_support_bundle
 from agentsync.engine.sync import SyncEngine
+from agentsync.engine.updater import check_for_updates, perform_update
 from agentsync.engine.watcher import SyncWatcher
 from agentsync.engine.workspace import WorkspaceEngine
 from agentsync.i18n import set_locale
@@ -53,8 +57,14 @@ app = typer.Typer(
 )
 tools_app = typer.Typer(help="Manage enabled AI tools, paths, and per-tool entity filters.")
 workspace_app = typer.Typer(help="Unified project workspace instruction & shared context synchronization.")
+autostart_app = typer.Typer(help="Configure unattended background Sync-on-Close autostart on login.")
+bundle_app = typer.Typer(help="Export or import Portable Profile Bundles (.zip) with SHA-256 verification.")
+backup_app = typer.Typer(help="Create manual verified snapshots and verify backup SHA-256 + SQLite integrity.")
 app.add_typer(tools_app, name="tools")
 app.add_typer(workspace_app, name="workspace")
+app.add_typer(autostart_app, name="autostart")
+app.add_typer(bundle_app, name="bundle")
+app.add_typer(backup_app, name="backup")
 console = Console()
 
 _ACTION_COLORS = {
@@ -789,7 +799,11 @@ def cmd_sync(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show diff plan without modifying any files."),
     force: bool = typer.Option(False, "--force", help="Ignore running application lock guard."),
     include_subagents: bool = typer.Option(False, "--include-subagents", help="Include subagent chats."),
-    backup: bool = typer.Option(False, "--backup", help="Create a versioned backup before applying changes."),
+    backup: bool = typer.Option(
+        True,
+        "--backup/--no-backup",
+        help="Automatically create a SHA-256 + SQLite verified backup before mutating (enabled by default).",
+    ),
     targets: str | None = typer.Option(None, "--targets", help="Comma-separated target tools."),
     include: list[str] = typer.Option([], "--include", help="Include selectors, e.g. skills:*,mcp."),
     exclude: list[str] = typer.Option([], "--exclude", help="Exclude selectors, e.g. mcp:internal-*."),
@@ -832,11 +846,12 @@ def cmd_sync(
 def cmd_watch(
     debounce: float = typer.Option(2.0, "--debounce", help="Debounce quiet interval in seconds."),
     force: bool = typer.Option(False, "--force", help="Allow writes while target apps are running."),
+    daemon: bool = typer.Option(False, "--daemon", help="Run silently with rotating daemon.log and Sync-on-Close."),
     include_subagents: bool = typer.Option(False, "--include-subagents", help="Include subagent chats."),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Run continuous debounced file-watching synchronization in the background."""
+    """Run continuous debounced file-watching synchronization with automatic Sync-on-Close."""
     _, cfg = _load_effective_config(config_file, data_dir)
     adapters = _build_adapters(cfg)
     options = SyncOptions(
@@ -847,23 +862,264 @@ def cmd_watch(
     )
 
     def _on_done(plan: SyncPlan) -> None:
+        if daemon:
+            return
         if plan.is_empty:
             console.print("[dim]watch: no changes detected[/dim]")
         else:
             console.print(
                 f"[green]watch: applied {len(plan.mutating_actions)} action(s) "
-                f"(conflicts={len(plan.conflict_actions)}, skipped={len(plan.skipped_actions)})[/green]"
+                f"(conflicts={len(plan.conflict_actions)}, skipped={len(plan.skipped_actions)}, "
+                f"backup={plan.backup_id or '-'})[/green]"
             )
 
     def _on_err(exc: Exception) -> None:
-        console.print(f"[yellow]watch: {mask_text(str(exc))}[/yellow]")
+        if not daemon:
+            console.print(f"[yellow]watch: {mask_text(str(exc))}[/yellow]")
 
-    console.print(
-        f"[cyan]Starting watch mode across {', '.join(a.tool_name for a in adapters)} "
-        f"(debounce={debounce}s). Press Ctrl+C to stop.[/cyan]"
+    def _on_log(level: str, msg: str) -> None:
+        if not daemon:
+            color = "yellow" if level == "warning" else ("red" if level == "error" else "dim")
+            console.print(f"[{color}]watch: {mask_text(msg)}[/{color}]")
+
+    if not daemon:
+        console.print(
+            f"[cyan]Starting watch mode across {', '.join(a.tool_name for a in adapters)} "
+            f"(debounce={debounce}s, Sync-on-Close enabled). Press Ctrl+C to stop.[/cyan]"
+        )
+    watcher = SyncWatcher(
+        cfg,
+        adapters,
+        options=options,
+        on_sync_done=_on_done,
+        on_error=_on_err,
+        on_log=_on_log,
+        daemon_mode=daemon,
+        run_startup_sync=True,
     )
-    watcher = SyncWatcher(cfg, adapters, options=options, on_sync_done=_on_done, on_error=_on_err)
     watcher.run_forever()
+
+
+# --- Autostart, Self-Updater, Portable Bundles, Support Bundle & Backup Verification ---
+
+
+@autostart_app.command("status")
+def cmd_autostart_status(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Inspect whether unattended background Sync-on-Close autostart is enabled."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    st = autostart_status(cfg, config_path=mgr.config_path, data_dir=data_dir)
+    badge = "[green]ENABLED[/green]" if st.enabled else "[yellow]DISABLED[/yellow]"
+    console.print(
+        Panel(
+            f"State     : {badge}\n"
+            f"Platform  : {st.platform} ({st.mechanism})\n"
+            f"Artifact  : {st.artifact_path}\n"
+            f"Command   : {st.executable}\n"
+            f"Daemon log: {cfg.daemon_log_path}\n"
+            f"Details   : {st.detail}",
+            title="AgentSync Autostart Status",
+        )
+    )
+
+
+@autostart_app.command("enable")
+def cmd_autostart_enable(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Enable unattended background synchronization on login (no Administrator privileges required)."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    try:
+        st = enable_autostart(cfg, config_path=mgr.config_path, data_dir=data_dir)
+    except Exception as exc:
+        console.print(f"[bold red]Failed to enable autostart:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    cfg.autostart_enabled = True
+    mgr.save(cfg)
+    console.print(f"[green]Autostart enabled ({st.mechanism}):[/green] {st.detail}")
+    console.print(f"[dim]Artifact: {st.artifact_path} | Log: {cfg.daemon_log_path}[/dim]")
+
+
+@autostart_app.command("disable")
+def cmd_autostart_disable(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Disable and remove unattended background autostart."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    st = disable_autostart(cfg)
+    cfg.autostart_enabled = False
+    mgr.save(cfg)
+    console.print(f"[yellow]Autostart disabled ({st.mechanism}):[/yellow] {st.detail}")
+
+
+@app.command("update")
+def cmd_update(
+    check: bool = typer.Option(False, "--check", help="Check for newer releases without installing."),
+    force: bool = typer.Option(False, "--force", help="Bypass 12-hour update cache and force upgrade."),
+    pre: bool = typer.Option(False, "--pre", help="Include pre-release versions."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Check for newer AgentSync releases on GitHub and self-update in place."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    info = check_for_updates(cfg.update_cache_path, force=(force or check), include_pre=pre)
+    if info.error:
+        console.print(f"[yellow]Update check failed (offline or rate-limited):[/yellow] {info.error}")
+        console.print(f"[dim]Current version: v{info.current_version} (install method: {info.install_method})[/dim]")
+        if check:
+            return
+    elif info.update_available:
+        console.print(
+            f"[green]Update available:[/green] v{info.current_version} -> [bold cyan]v{info.latest_version}[/bold cyan] "
+            f"(install method: {info.install_method})"
+        )
+        console.print(f"[dim]Release: {info.release_url}[/dim]")
+    else:
+        console.print(
+            f"[green]AgentSync is up to date[/green] (v{info.current_version}, install method: {info.install_method})."
+        )
+        if not force or check:
+            return
+
+    if check:
+        return
+
+    console.print(f"[cyan]Running in-place upgrade via {info.install_method}...[/cyan]")
+    res = perform_update(method=info.install_method, include_pre=pre)
+    if res.success:
+        console.print(
+            f"[green]Upgrade completed:[/green] v{res.previous_version} -> v{res.new_version or info.latest_version}"
+        )
+        if res.restart_notice:
+            console.print(f"[yellow]{res.restart_notice}[/yellow]")
+    else:
+        console.print(f"[bold red]Upgrade failed:[/bold red] {res.error}")
+        if res.restart_notice:
+            console.print(f"[yellow]{res.restart_notice}[/yellow]")
+        raise typer.Exit(code=1)
+
+
+@bundle_app.command("export")
+def cmd_bundle_export(
+    output: Path = typer.Argument(..., help="Output .zip path for the Portable Profile Bundle."),
+    include_secrets: bool = typer.Option(
+        False,
+        "--include-secrets",
+        help="Include literal secret values (default redacts all literal secrets to ${ENV_VAR}).",
+    ),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Export canonical skills, MCP servers, and global instructions to a SHA-256 verified .zip bundle."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    adapters = _build_adapters(cfg)
+    mf = export_profile_bundle(output, adapters, include_secrets=include_secrets)
+    redacted_str = "secrets REDACTED" if mf.secrets_redacted else "secrets INCLUDED"
+    console.print(
+        f"[green]Exported Portable Profile Bundle ({redacted_str}):[/green] {output}\n"
+        f"  Skills: {mf.skill_count} | MCP: {mf.mcp_count} | Global rules: {'yes' if mf.has_global_instructions else 'no'} | "
+        f"Verified entries: {len(mf.sha256_by_entry)}"
+    )
+
+
+@bundle_app.command("import")
+def cmd_bundle_import(
+    bundle_zip: Path = typer.Argument(..., help="Input Portable Profile Bundle .zip file."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Verify SHA-256 manifest and preview import without writes."),
+    force: bool = typer.Option(False, "--force", help="Ignore running application lock guard."),
+    targets: str | None = typer.Option(None, "--targets", help="Comma-separated target tools."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Verify SHA-256 checksums and import a Portable Profile Bundle into enabled AI tools."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    target_list = [x.strip() for x in targets.split(",") if x.strip()] if targets else None
+    adapters = _build_adapters(cfg, targets=target_list)
+    try:
+        res = import_profile_bundle(bundle_zip, cfg, adapters, dry_run=dry_run, force=force)
+    except (AppsRunningError, FileNotFoundError, ValueError) as exc:
+        console.print(f"[bold red]Bundle import failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    badge = "[yellow](DRY-RUN)[/yellow]" if res.dry_run else "[green](IMPORTED)[/green]"
+    console.print(
+        f"Bundle import {badge}: verified={res.verified_entries} entries, skills={res.skills_imported}, "
+        f"mcp={res.mcp_imported}, rules={'yes' if res.instructions_imported else 'no'}, "
+        f"targets={', '.join(res.target_tools)}" + (f" [backup={res.backup_id}]" if res.backup_id else "")
+    )
+
+
+@app.command("support-bundle")
+def cmd_support_bundle(
+    output: Path | None = typer.Option(None, "--output", "-o", help="Output .zip path."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Create a privacy-safe anonymized diagnostics .zip (zero chats, secrets, emails, or usernames)."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    adapters = _build_adapters(cfg)
+    out = output or (cfg.resolved_data_dir() / "agentsync-support-bundle.zip")
+    path = create_support_bundle(out, cfg, adapters)
+    console.print(
+        f"[green]Created anonymized support bundle:[/green] {path}\n"
+        "[dim]Strictly stripped: API keys, bearer tokens, emails, OS usernames, and all chat contents.[/dim]"
+    )
+
+
+@backup_app.command("create")
+def cmd_backup_create(
+    reason: str = typer.Option("manual", "--reason", help="Backup label/reason."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Create a manual SHA-256 + SQLite verified backup snapshot immediately."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    adapters = _build_adapters(cfg)
+    mf = BackupManager(cfg).create_backup(adapters, reason=reason)
+    console.print(
+        f"[green]Created verified backup snapshot:[/green] {mf.backup_id} "
+        f"({len(mf.entries)} files across {', '.join(mf.tools)})"
+    )
+
+
+@backup_app.command("verify")
+def cmd_backup_verify(
+    backup_id: str | None = typer.Option(None, "--id", help="Verify a single backup ID (defaults to all)."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Verify SHA-256 digests and SQLite PRAGMA integrity_check across stored backup snapshots."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    bmgr = BackupManager(cfg)
+    reports = [bmgr.verify_backup(backup_id)] if backup_id else bmgr.verify_all_backups()
+    if not reports:
+        console.print("[yellow]No backups found to verify.[/yellow]")
+        return
+    tbl = Table(title=f"Backup Verification ({len(reports)} snapshot(s))", expand=True)
+    tbl.add_column("Backup ID", style="cyan")
+    tbl.add_column("Status", no_wrap=True)
+    tbl.add_column("Files", justify="right")
+    tbl.add_column("SQLite DBs", justify="right")
+    tbl.add_column("Size (KB)", justify="right")
+    tbl.add_column("Details", overflow="fold")
+    failed = 0
+    for r in reports:
+        if not r.ok:
+            failed += 1
+        tbl.add_row(
+            r.backup_id,
+            "[green]OK[/green]" if r.ok else "[bold red]FAIL[/bold red]",
+            str(r.checked_files),
+            str(r.checked_sqlite),
+            str(r.total_bytes // 1024),
+            "ok" if r.ok else "; ".join(r.errors),
+        )
+    console.print(tbl)
+    if failed:
+        raise typer.Exit(code=1)
 
 
 @app.command("status")

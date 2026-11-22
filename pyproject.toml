@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentsync"
-version = "0.3.0"
+version = "0.4.0"
 description = "Universal cross-platform synchronization, patching, context-handoff, and TUI suite for AI coding agents"
 readme = "README.md"
 license = { text = "MIT" }
@@ -79,3 +79,4 @@ ignore = ["E501", "B008"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+asyncio_default_fixture_loop_scope = "function"

@@ -35,7 +35,12 @@ from agentsync.utils.atomic_io import (
     atomic_write_text,
     atomic_write_toml,
     remove_tree_if_exists,
+    sqlite_cleanup_sidecars,
+    sqlite_integrity_check,
+    sqlite_restore_from_snapshot,
     sqlite_safe_connect,
+    sqlite_transactional_edit,
+    sqlite_wal_checkpoint,
     sync_directory_files,
 )
 from agentsync.utils.paths import normalize_path, path_dedup_key, to_native_path
@@ -305,7 +310,7 @@ def _serialize_codex_mcp_entry(server: McpServer) -> dict[str, Any]:
 
 
 def validate_codex_rollout_file(path: Path) -> list[str]:
-    """Validate a Codex rollout JSONL file against native thread-store expectations."""
+    """Validate a Codex rollout JSONL file against native thread-store and Desktop hydration expectations."""
     errors: list[str] = []
     if not path.exists():
         return [f"Missing rollout file: {path}"]
@@ -339,8 +344,16 @@ def validate_codex_rollout_file(path: Path) -> list[str]:
             missing = [k for k in REQUIRED_SESSION_META_KEYS if not payload.get(k)]
             if missing:
                 errors.append(f"Line 1 session_meta payload missing required keys: {', '.join(missing)}")
+            if payload.get("originator") == "agy-codex-sync" or payload.get("cli_version") == "agy-codex-sync":
+                errors.append("Legacy broken originator/cli_version 'agy-codex-sync' (causes infinite spinner)")
 
-    # Validate every subsequent line is valid JSON with type + payload
+    # Validate every subsequent line and verify hydration lifecycle events for message-bearing rollouts
+    has_response_msg = False
+    has_task_started = False
+    has_turn_context = False
+    has_item_completed = False
+    has_task_complete = False
+
     for idx, line in enumerate(non_empty[1:], start=2):
         try:
             obj = json.loads(line)
@@ -350,6 +363,36 @@ def validate_codex_rollout_file(path: Path) -> list[str]:
         if not isinstance(obj, dict) or not obj.get("type") or not obj.get("timestamp"):
             errors.append(f"Line {idx} missing required envelope keys ('timestamp', 'type')")
             break
+        etype = obj.get("type")
+        pl = obj.get("payload")
+        if etype == "response_item" and isinstance(pl, dict) and pl.get("type") == "message":
+            has_response_msg = True
+        elif etype == "turn_context":
+            has_turn_context = True
+        elif etype == "event_msg" and isinstance(pl, dict):
+            pt = pl.get("type")
+            if pt == "task_started":
+                has_task_started = True
+            elif pt == "item_completed":
+                has_item_completed = True
+            elif pt == "task_complete":
+                has_task_complete = True
+
+    if has_response_msg:
+        missing_events = []
+        if not has_task_started:
+            missing_events.append("task_started")
+        if not has_turn_context:
+            missing_events.append("turn_context")
+        if not has_item_completed:
+            missing_events.append("item_completed")
+        if not has_task_complete:
+            missing_events.append("task_complete")
+        if missing_events:
+            errors.append(
+                f"Rollout missing Desktop hydration lifecycle events: {', '.join(missing_events)} "
+                "(causes infinite loading spinner)"
+            )
 
     return errors
 
@@ -408,6 +451,14 @@ class CodexAdapter(ToolAdapter):
         return self.root_path / "thread_history_1.sqlite"
 
     @property
+    def codex_db(self) -> Path:
+        return self.root_path / "sqlite" / "codex.db"
+
+    @property
+    def sqlite_backups_dir(self) -> Path:
+        return self.root_path / "sqlite" / "db-backups"
+
+    @property
     def sessions_dir(self) -> Path:
         return self.root_path / "sessions"
 
@@ -428,6 +479,7 @@ class CodexAdapter(ToolAdapter):
             (self.session_index_jsonl, "file"),
             (self.state_db, "sqlite"),
             (self.thread_history_db, "sqlite"),
+            (self.codex_db, "sqlite"),
         ]
         dirs = [
             self.skills_dir,
@@ -1010,8 +1062,7 @@ class CodexAdapter(ToolAdapter):
                 copy_item.updated_at_ms = copy_item.created_at_ms
             updated[key] = copy_item
 
-        conn = self._ensure_state_db()
-        try:
+        def _mutate_projects(conn: sqlite3.Connection) -> bool:
             existing_rows = conn.execute(
                 """
                 SELECT p.id, p.name, r.path
@@ -1083,12 +1134,10 @@ class CodexAdapter(ToolAdapter):
                             (pid, native_path),
                         )
                         db_dirty = True
+            return db_dirty
 
-            if db_dirty:
-                conn.commit()
-                changed = True
-        finally:
-            conn.close()
+        if sqlite_transactional_edit(self.state_db, _mutate_projects, ddl=_STATE_5_MIN_DDL):
+            changed = True
 
         # Sync .codex-global-state.json
         gs = self._load_global_state()
@@ -1463,7 +1512,8 @@ class CodexAdapter(ToolAdapter):
             t_start_iso = _iso_utc_ms(t_start_ms)
             t_end_iso = _iso_utc_ms(t_end_ms)
 
-            # 1. task_started event
+            # 1. task_started event (matches native Codex Desktop hydration schema)
+            effort = defaults.get("reasoning_effort") or "medium"
             turn_start_ord, turn_start_byte = _append(
                 {
                     "timestamp": t_start_iso,
@@ -1473,6 +1523,8 @@ class CodexAdapter(ToolAdapter):
                         "turn_id": turn_id,
                         "root_turn_id": turn_id,
                         "started_at": t_start_ms // 1000,
+                        "model_context_window": 258400,
+                        "collaboration_mode_kind": "default",
                         "turn_attribution": {
                             "turn_id": turn_id,
                             "turn_trigger": "composer",
@@ -1484,7 +1536,7 @@ class CodexAdapter(ToolAdapter):
                 }
             )
 
-            # 2. turn_context
+            # 2. turn_context (matches native Codex Desktop hydration schema)
             _append(
                 {
                     "timestamp": t_start_iso,
@@ -1496,8 +1548,18 @@ class CodexAdapter(ToolAdapter):
                         "approval_policy": "never",
                         "approvals_reviewer": "user",
                         "sandbox_policy": {"type": "danger-full-access"},
+                        "permission_profile": {"type": "disabled"},
+                        "active_permission_profile": {"id": ":danger-full-access"},
                         "model": model_name,
-                        "effort": defaults.get("reasoning_effort") or "medium",
+                        "effort": effort,
+                        "collaboration_mode": {
+                            "mode": "default",
+                            "settings": {
+                                "model": model_name,
+                                "reasoning_effort": effort,
+                                "developer_instructions": None,
+                            },
+                        },
                     },
                 }
             )
@@ -1555,6 +1617,7 @@ class CodexAdapter(ToolAdapter):
                             "content": [{"type": "text", "text": msg.text, "text_elements": []}],
                         },
                         ensure_ascii=False,
+                        separators=(",", ":"),
                     )
                     items_for_db.append((item_id, ic_ord, mts, "userMessage", db_json))
                 else:
@@ -1575,6 +1638,7 @@ class CodexAdapter(ToolAdapter):
                                     "type": "AgentMessage",
                                     "id": item_id,
                                     "content": [{"type": "Text", "text": msg.text}],
+                                    "phase": "final_answer",
                                 },
                             },
                         }
@@ -1611,6 +1675,7 @@ class CodexAdapter(ToolAdapter):
                             "questions": None,
                         },
                         ensure_ascii=False,
+                        separators=(",", ":"),
                     )
                     items_for_db.append((item_id, ic_ord, mts, "agentMessage", db_json))
 
@@ -1672,50 +1737,57 @@ class CodexAdapter(ToolAdapter):
         rel_dir = self.sessions_dir / f"{dt.year:04d}" / f"{dt.month:02d}" / f"{dt.day:02d}"
         rollout_file = rel_dir / f"rollout-{dt.strftime('%Y-%m-%dT%H-%M-%S')}-{tid}.jsonl"
 
-        sconn = self._ensure_state_db()
-        try:
-            existing_row = sconn.execute(
-                "SELECT rollout_path FROM threads WHERE id = ?", (tid,)
-            ).fetchone()
-            if existing_row and existing_row["rollout_path"]:
-                existing_rp = Path(to_native_path(existing_row["rollout_path"]))
-                if str(self.sessions_dir).lower() in str(existing_rp).lower():
-                    rollout_file = existing_rp
+        if self.state_db.exists():
+            rconn = sqlite_safe_connect(self.state_db, readonly=True)
+            rconn.row_factory = sqlite3.Row
+            try:
+                existing_row = rconn.execute(
+                    "SELECT rollout_path FROM threads WHERE id = ?", (tid,)
+                ).fetchone()
+                if existing_row and existing_row["rollout_path"]:
+                    existing_rp = Path(to_native_path(existing_row["rollout_path"]))
+                    if str(self.sessions_dir).lower() in str(existing_rp).lower():
+                        rollout_file = existing_rp
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                rconn.close()
 
-            rollout_text, turn_records, total_bytes, next_ordinal = self._build_conformant_rollout(
-                tid=tid,
-                cwd_native=cwd_native,
-                created_ms=created_ms,
-                updated_ms=updated_ms,
-                messages=chat.messages,
-                defaults=defaults,
-            )
+        rollout_text, turn_records, total_bytes, next_ordinal = self._build_conformant_rollout(
+            tid=tid,
+            cwd_native=cwd_native,
+            created_ms=created_ms,
+            updated_ms=updated_ms,
+            messages=chat.messages,
+            defaults=defaults,
+        )
 
-            # Validate generated JSONL strictly before atomic replace
-            def _validate_jsonl(text: str) -> None:
-                raw_lines = [ln for ln in text.split("\n") if ln.strip()]
-                if not raw_lines:
-                    raise ValueError("Empty Codex rollout JSONL")
-                first = json.loads(raw_lines[0])
-                if first.get("type") != "session_meta":
-                    raise ValueError("Codex rollout line 1 is not session_meta")
-                pl = first.get("payload") or {}
-                for req in REQUIRED_SESSION_META_KEYS:
-                    if not pl.get(req):
-                        raise ValueError(f"Codex session_meta missing required field '{req}'")
-                for ln in raw_lines[1:]:
-                    json.loads(ln)
+        # Validate generated JSONL strictly before atomic replace
+        def _validate_jsonl(text: str) -> None:
+            raw_lines = [ln for ln in text.split("\n") if ln.strip()]
+            if not raw_lines:
+                raise ValueError("Empty Codex rollout JSONL")
+            first = json.loads(raw_lines[0])
+            if first.get("type") != "session_meta":
+                raise ValueError("Codex rollout line 1 is not session_meta")
+            pl = first.get("payload") or {}
+            for req in REQUIRED_SESSION_META_KEYS:
+                if not pl.get(req):
+                    raise ValueError(f"Codex session_meta missing required field '{req}'")
+            for ln in raw_lines[1:]:
+                json.loads(ln)
 
-            changed = atomic_write_text(rollout_file, rollout_text, validator=_validate_jsonl)
+        changed = atomic_write_text(rollout_file, rollout_text, validator=_validate_jsonl)
 
-            first_user_msg = next(
-                (m.text for m in chat.messages if m.role == "user" and m.text.strip()),
-                "",
-            )
-            title = (
-                chat.title or (first_user_msg.splitlines()[0][:80] if first_user_msg else "Synced Chat")
-            ).strip()
+        first_user_msg = next(
+            (m.text for m in chat.messages if m.role == "user" and m.text.strip()),
+            "",
+        )
+        title = (
+            chat.title or (first_user_msg.splitlines()[0][:80] if first_user_msg else "Synced Chat")
+        ).strip()
 
+        def _mutate_state_db(sconn: sqlite3.Connection) -> None:
             sconn.execute(
                 """
                 INSERT INTO threads(
@@ -1728,7 +1800,7 @@ class CodexAdapter(ToolAdapter):
                     project_id, originator, creator_user_id, creator_account_id
                 ) VALUES(
                     ?, ?, ?, ?, 'vscode', 'openai',
-                    ?, ?, '{"type":"disabled"}', 'never', 0, 1,
+                    ?, ?, '{"type":"disabled"}', 'never', 0, 0,
                     0, ?, ?, 'enabled',
                     ?, ?,
                     ?, ?, 'user', ?,
@@ -1740,14 +1812,17 @@ class CodexAdapter(ToolAdapter):
                     updated_at=excluded.updated_at,
                     cwd=excluded.cwd,
                     title=excluded.title,
+                    has_user_event=0,
+                    originator='Codex Desktop',
                     cli_version=excluded.cli_version,
                     first_user_message=excluded.first_user_message,
-                    model=COALESCE(threads.model, excluded.model),
-                    reasoning_effort=COALESCE(threads.reasoning_effort, excluded.reasoning_effort),
+                    model=COALESCE(NULLIF(threads.model, ''), excluded.model),
+                    reasoning_effort=COALESCE(NULLIF(threads.reasoning_effort, ''), excluded.reasoning_effort),
                     updated_at_ms=excluded.updated_at_ms,
                     preview=excluded.preview,
                     recency_at=excluded.recency_at,
                     recency_at_ms=excluded.recency_at_ms,
+                    history_mode='paginated',
                     name=excluded.name,
                     project_id=excluded.project_id,
                     creator_user_id=COALESCE(threads.creator_user_id, excluded.creator_user_id),
@@ -1775,13 +1850,11 @@ class CodexAdapter(ToolAdapter):
                     defaults.get("creator_account_id"),
                 ),
             )
-            sconn.commit()
-            changed = True
-        finally:
-            sconn.close()
 
-        hconn = self._ensure_history_db()
-        try:
+        sqlite_transactional_edit(self.state_db, _mutate_state_db, ddl=_STATE_5_MIN_DDL)
+        changed = True
+
+        def _mutate_history_db(hconn: sqlite3.Connection) -> None:
             hconn.execute("DELETE FROM thread_items WHERE thread_id = ?", (tid,))
             hconn.execute("DELETE FROM thread_turns WHERE thread_id = ?", (tid,))
             for tr in turn_records:
@@ -1828,9 +1901,63 @@ class CodexAdapter(ToolAdapter):
                 """,
                 (tid, total_bytes, next_ordinal),
             )
-            hconn.commit()
-        finally:
-            hconn.close()
+
+        sqlite_transactional_edit(self.thread_history_db, _mutate_history_db, ddl=_THREAD_HISTORY_MIN_DDL)
+
+        # Keep Codex Desktop's sqlite/codex.db local_thread_catalog consistent (WAL-safe + integrity checked)
+        if self.codex_db.exists():
+            def _mutate_codex_catalog(cconn: sqlite3.Connection) -> None:
+                tables = {
+                    r[0]
+                    for r in cconn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                if "local_thread_catalog" not in tables:
+                    return
+                cols = {
+                    r[1]
+                    for r in cconn.execute("PRAGMA table_info('local_thread_catalog')").fetchall()
+                }
+                if not {"host_id", "thread_id", "display_title", "source_created_at", "source_updated_at"}.issubset(cols):
+                    return
+                obs_seq = 1
+                if "local_thread_catalog_sync_state" in tables:
+                    srow = cconn.execute(
+                        "SELECT observation_sequence FROM local_thread_catalog_sync_state WHERE host_id = 'local'"
+                    ).fetchone()
+                    if srow and srow[0]:
+                        obs_seq = int(srow[0])
+                cconn.execute(
+                    """
+                    INSERT INTO local_thread_catalog(
+                        host_id, thread_id, display_title, source_created_at, source_updated_at,
+                        cwd, source_kind, model_provider, observation_sequence,
+                        missing_candidate, source_recency_at, pending_observed_title, project_id
+                    ) VALUES('local', ?, ?, ?, ?, ?, 'vscode', 'openai', ?, 0, ?, 0, ?)
+                    ON CONFLICT(host_id, thread_id) DO UPDATE SET
+                        display_title=excluded.display_title,
+                        source_updated_at=excluded.source_updated_at,
+                        cwd=excluded.cwd,
+                        source_recency_at=excluded.source_recency_at,
+                        missing_candidate=0,
+                        project_id=excluded.project_id
+                    """,
+                    (
+                        tid,
+                        title,
+                        float(created_sec),
+                        float(updated_sec),
+                        cwd_native,
+                        obs_seq,
+                        float(updated_sec),
+                        codex_pid,
+                    ),
+                )
+                if "local_thread_catalog_metadata" in tables:
+                    cconn.execute(
+                        "UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1"
+                    )
+
+            sqlite_transactional_edit(self.codex_db, _mutate_codex_catalog)
 
         # Upsert session_index.jsonl
         si_entries: dict[str, dict[str, Any]] = {}
@@ -1877,6 +2004,96 @@ class CodexAdapter(ToolAdapter):
 
     # --- Diagnostics & Repair ---
 
+    def _find_recoverable_codex_db_backups(self) -> list[Path]:
+        """Return valid SQLite recovery candidates under ~/.codex/sqlite/db-backups/sqlite-*."""
+        found: list[Path] = []
+        if not self.sqlite_backups_dir.exists():
+            return found
+        for sub in sorted(self.sqlite_backups_dir.glob("sqlite-*"), reverse=True):
+            cand = sub / "codex.db"
+            if cand.exists() and cand.is_file():
+                ok, _ = sqlite_integrity_check(cand, readonly=True)
+                if ok:
+                    found.append(cand)
+        return found
+
+    def _detect_spinning_threads(self) -> list[tuple[str, str, str]]:
+        """Return list of (thread_id, rollout_path, reason) for threads prone to Desktop infinite spinner."""
+        broken: list[tuple[str, str, str]] = []
+        if not self.state_db.exists():
+            return broken
+        seen: set[str] = set()
+        conn = sqlite_safe_connect(self.state_db, readonly=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            tables = {
+                r[0]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if "threads" not in tables:
+                return broken
+            rows = conn.execute(
+                "SELECT id, rollout_path, cli_version, originator, has_user_event, model FROM threads"
+            ).fetchall()
+            for r in rows:
+                tid = str(r["id"])
+                rp = str(r["rollout_path"] or "")
+                reasons: list[str] = []
+                is_legacy_synced = (
+                    r["cli_version"] in ("agy-codex-sync", "agentsync")
+                    or r["originator"] in ("agy-codex-sync", "agentsync")
+                )
+                if is_legacy_synced:
+                    reasons.append(f"legacy cli_version/originator '{r['cli_version'] or r['originator']}'")
+                if int(r["has_user_event"] or 0) == 1 and (
+                    is_legacy_synced or not r["cli_version"] or not r["model"]
+                ):
+                    reasons.append("non-native has_user_event=1 with missing model metadata")
+                clean_rp = rp.removeprefix("\\\\?\\") if rp.startswith("\\\\?\\") else rp
+                if is_legacy_synced and clean_rp and not Path(to_native_path(clean_rp)).exists():
+                    reasons.append("indexed synced rollout_path missing on disk")
+                if reasons:
+                    seen.add(tid)
+                    broken.append((tid, clean_rp, "; ".join(reasons)))
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+        # Check thread_history_1.sqlite for corrupted turn byte offsets (e.g. offset=0 on non-initial or inverted offsets)
+        if self.thread_history_db.exists():
+            hconn = sqlite_safe_connect(self.thread_history_db, readonly=True)
+            hconn.row_factory = sqlite3.Row
+            try:
+                htables = {
+                    r[0]
+                    for r in hconn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                if "thread_turns" in htables:
+                    bad_turns = hconn.execute(
+                        """
+                        SELECT DISTINCT thread_id
+                        FROM thread_turns
+                        WHERE rollout_byte_offset IS NULL
+                           OR rollout_end_byte_offset IS NULL
+                           OR rollout_byte_offset = 0
+                           OR rollout_byte_offset >= rollout_end_byte_offset
+                        """
+                    ).fetchall()
+                    for bt in bad_turns:
+                        tid = str(bt["thread_id"])
+                        if tid not in seen:
+                            seen.add(tid)
+                            broken.append(
+                                (tid, "", "invalid thread_turns rollout_byte_offset (causes infinite spinner)")
+                            )
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                hconn.close()
+
+        return broken
+
     def doctor(self) -> list[DoctorIssue]:
         issues: list[DoctorIssue] = []
 
@@ -1892,7 +2109,7 @@ class CodexAdapter(ToolAdapter):
                         code="CODEX_INVALID_TOML",
                         path=str(self.config_toml),
                         message=f"Invalid TOML syntax: {exc}",
-                        fixable=False,
+                        fixable=True,
                     )
                 )
 
@@ -1908,11 +2125,65 @@ class CodexAdapter(ToolAdapter):
                         code="CODEX_INVALID_GLOBAL_STATE",
                         path=str(self.global_state_json),
                         message=f"Invalid JSON syntax: {exc}",
-                        fixable=False,
+                        fixable=True,
                     )
                 )
 
-        # 3. Validate all rollout JSONL files in sessions/
+        # 3. Validate all 3 Codex SQLite databases (integrity_check + orphaned WAL/SHM + db-backups)
+        for label, db_path in (
+            ("codex.db", self.codex_db),
+            ("state_5.sqlite", self.state_db),
+            ("thread_history_1.sqlite", self.thread_history_db),
+        ):
+            if db_path.exists():
+                ok, detail = sqlite_integrity_check(db_path, readonly=True)
+                if not ok:
+                    issues.append(
+                        DoctorIssue(
+                            tool=self.tool_name,
+                            severity="error",
+                            code="CODEX_SQLITE_CORRUPT",
+                            path=str(db_path),
+                            message=f"{label} failed PRAGMA integrity_check: {detail}",
+                            fixable=True,
+                        )
+                    )
+            else:
+                # Detect orphaned -wal / -shm sidecars with missing parent DB
+                orphans = [
+                    f"{db_path}{suf}"
+                    for suf in ("-wal", "-shm", "-journal")
+                    if Path(f"{db_path}{suf}").exists()
+                ]
+                if orphans:
+                    issues.append(
+                        DoctorIssue(
+                            tool=self.tool_name,
+                            severity="error",
+                            code="CODEX_ORPHAN_WAL",
+                            path=orphans[0],
+                            message=f"Orphaned SQLite sidecar file(s) without parent {label}: {len(orphans)}",
+                            fixable=True,
+                        )
+                    )
+
+        recoverable = self._find_recoverable_codex_db_backups()
+        if recoverable:
+            issues.append(
+                DoctorIssue(
+                    tool=self.tool_name,
+                    severity="info",
+                    code="CODEX_DB_RECOVERY_BACKUPS",
+                    path=str(recoverable[0].parent),
+                    message=(
+                        f"Found {len(recoverable)} Codex auto-recovery DB backup(s) under sqlite/db-backups "
+                        f"(latest valid snapshot: {recoverable[0].parent.name})."
+                    ),
+                    fixable=False,
+                )
+            )
+
+        # 4. Validate all rollout JSONL files in sessions/
         if self.sessions_dir.exists():
             for rf in sorted(self.sessions_dir.rglob("*.jsonl")):
                 errs = validate_codex_rollout_file(rf)
@@ -1928,8 +2199,24 @@ class CodexAdapter(ToolAdapter):
                         )
                     )
 
-        # 4. Check duplicate projects in state_5.sqlite
-        projs = self.read_projects()
+        # 5. Detect threads with broken state_5 / thread_history hydration metadata (infinite spinner)
+        for tid, rp, reason in self._detect_spinning_threads():
+            issues.append(
+                DoctorIssue(
+                    tool=self.tool_name,
+                    severity="error",
+                    code="CODEX_SPINNING_THREAD",
+                    path=rp or str(self.state_db),
+                    message=f"Thread '{tid}' has hydration metadata error: {reason}",
+                    fixable=True,
+                )
+            )
+
+        # 6. Check duplicate projects in state_5.sqlite (tolerate corrupt config.toml/JSON already reported above)
+        try:
+            projs = self.read_projects()
+        except Exception:
+            projs = {}
         for p in projs.values():
             dups = p.duplicate_count(self.tool_name)
             if dups > 0:
@@ -1944,7 +2231,7 @@ class CodexAdapter(ToolAdapter):
                     )
                 )
 
-        # 5. Check duplicate skills between ~/.codex/skills and ~/.agents/skills (anti-duplication trap)
+        # 7. Check duplicate skills between ~/.codex/skills and ~/.agents/skills (anti-duplication trap)
         agents_skills_dir = self.root_path.parent / ".agents" / "skills"
         if self.skills_dir.exists() and agents_skills_dir.exists():
             codex_skill_names = {
@@ -1974,7 +2261,7 @@ class CodexAdapter(ToolAdapter):
                     )
                 )
 
-        # 6. Check broken symlinks inside ~/.codex/skills
+        # 8. Check broken symlinks inside ~/.codex/skills
         if self.skills_dir.exists():
             for entry in sorted(self.skills_dir.iterdir()):
                 if entry.is_symlink() and not entry.exists():
@@ -1993,8 +2280,84 @@ class CodexAdapter(ToolAdapter):
 
     def repair(self, quarantine_dir: Path, dry_run: bool = False) -> RepairResult:
         result = RepairResult(tool=self.tool_name)
-        # Deduplicate projects in state_5.sqlite if duplicates exist
-        projs = self.read_projects()
+        ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+        # 0. SQLite deep repair: orphaned WAL/SHM cleanup, corrupt codex.db recovery, and clean WAL checkpoints
+        for label, db_path in (
+            ("codex.db", self.codex_db),
+            ("state_5.sqlite", self.state_db),
+            ("thread_history_1.sqlite", self.thread_history_db),
+        ):
+            if not db_path.exists():
+                orphans = [
+                    Path(f"{db_path}{suf}")
+                    for suf in ("-wal", "-shm", "-journal")
+                    if Path(f"{db_path}{suf}").exists()
+                ]
+                if orphans:
+                    if dry_run:
+                        result.fixed_count += len(orphans)
+                        result.details.append(f"Would remove {len(orphans)} orphaned sidecar(s) for missing {label}")
+                    else:
+                        removed = sqlite_cleanup_sidecars(db_path)
+                        result.fixed_count += len(removed)
+                        result.details.append(f"Removed {len(removed)} orphaned sidecar(s) for missing {label}")
+                continue
+
+            ok, detail = sqlite_integrity_check(db_path, readonly=True)
+            if not ok:
+                if db_path == self.codex_db:
+                    recoverable = self._find_recoverable_codex_db_backups()
+                    if recoverable:
+                        best = recoverable[0]
+                        if dry_run:
+                            result.fixed_count += 1
+                            result.details.append(
+                                f"Would quarantine damaged {label} and recover from {best.parent.name}/codex.db"
+                            )
+                        else:
+                            q_db = quarantine_dir / f"{ts}_codex_db" / label
+                            q_db.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(db_path, q_db)
+                            result.quarantined_files.append(str(q_db))
+                            sqlite_restore_from_snapshot(best, db_path)
+                            result.fixed_count += 1
+                            result.details.append(
+                                f"Recovered damaged {label} from verified snapshot {best.parent.name}"
+                            )
+                        continue
+                # Fallback: quarantine stale sidecars and verify if main DB becomes healthy
+                if dry_run:
+                    result.fixed_count += 1
+                    result.details.append(
+                        f"Would quarantine stale WAL/SHM sidecars and inspect damaged {label} ({detail})"
+                    )
+                else:
+                    q_dir = quarantine_dir / f"{ts}_codex_db"
+                    q_dir.mkdir(parents=True, exist_ok=True)
+                    for suf in ("-wal", "-shm", "-journal"):
+                        sc = Path(f"{db_path}{suf}")
+                        if sc.exists():
+                            shutil.copy2(sc, q_dir / sc.name)
+                            result.quarantined_files.append(str(q_dir / sc.name))
+                            sc.unlink()
+                    ok_after, _ = sqlite_integrity_check(db_path, readonly=True)
+                    if ok_after:
+                        result.fixed_count += 1
+                        result.details.append(f"Healed {label} by quarantining corrupted WAL/SHM sidecars")
+            elif not dry_run:
+                # Safe WAL checkpoint (TRUNCATE) while app is closed to prevent future disk I/O error
+                wal_file = Path(f"{db_path}-wal")
+                if wal_file.exists() and wal_file.stat().st_size > 0:
+                    ckpt_ok, ckpt_msg = sqlite_wal_checkpoint(db_path, mode="TRUNCATE")
+                    if ckpt_ok:
+                        result.details.append(f"Checkpointed {label} WAL cleanly ({ckpt_msg})")
+
+        # 1. Deduplicate projects in state_5.sqlite if duplicates exist
+        try:
+            projs = self.read_projects()
+        except Exception:
+            projs = {}
         has_dup_projects = any(p.duplicate_count(self.tool_name) > 0 for p in projs.values())
         if has_dup_projects:
             if dry_run:
@@ -2007,7 +2370,7 @@ class CodexAdapter(ToolAdapter):
                     result.fixed_count += 1
                     result.details.append("Collapsed duplicate project rows in state_5.sqlite")
 
-        # Clean broken symlinks inside ~/.codex/skills
+        # 2. Clean broken symlinks inside ~/.codex/skills
         if self.skills_dir.exists():
             for entry in sorted(self.skills_dir.iterdir()):
                 if entry.is_symlink() and not entry.exists():
@@ -2019,7 +2382,7 @@ class CodexAdapter(ToolAdapter):
                         result.fixed_count += 1
                         result.details.append(f"Removed dangling Codex skill symlink '{entry.name}'")
 
-        # Deduplicate overlapping skills between ~/.codex/skills and ~/.agents/skills
+        # 3. Deduplicate overlapping skills between ~/.codex/skills and ~/.agents/skills
         agents_skills_dir = self.root_path.parent / ".agents" / "skills"
         if self.skills_dir.exists() and agents_skills_dir.exists():
             codex_names = {
@@ -2035,8 +2398,7 @@ class CodexAdapter(ToolAdapter):
                             f"Would quarantine duplicate ~/.agents/skills/{adir.name} (already in ~/.codex/skills)"
                         )
                     else:
-                        ts_dup = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-                        q_dup = quarantine_dir / f"{ts_dup}_agents_skills_dup" / adir.name
+                        q_dup = quarantine_dir / f"{ts}_agents_skills_dup" / adir.name
                         q_dup.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copytree(adir, q_dup, dirs_exist_ok=True)
                         remove_tree_if_exists(adir)
@@ -2045,9 +2407,6 @@ class CodexAdapter(ToolAdapter):
                         result.details.append(
                             f"Quarantined duplicate ~/.agents/skills/{adir.name} to prevent double-loading in Codex"
                         )
-
-        if not self.sessions_dir.exists():
-            return result
 
         chats_by_id = {c.native_id: c for c in self.read_chats(projs, include_subagents=True)}
 
@@ -2064,60 +2423,84 @@ class CodexAdapter(ToolAdapter):
             finally:
                 conn.close()
 
-        ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         q_root = quarantine_dir / f"{ts}_codex"
+        repaired_tids: set[str] = set()
 
-        for rf in sorted(self.sessions_dir.rglob("*.jsonl")):
-            errs = validate_codex_rollout_file(rf)
-            if not errs:
+        # 4. Quarantine and regenerate broken rollout JSONL files
+        if self.sessions_dir.exists():
+            for rf in sorted(self.sessions_dir.rglob("*.jsonl")):
+                errs = validate_codex_rollout_file(rf)
+                if not errs:
+                    continue
+
+                tid = path_to_tid.get(path_dedup_key(str(rf)))
+                if not tid:
+                    try:
+                        first = json.loads(
+                            rf.read_text(encoding="utf-8-sig", errors="replace").splitlines()[0]
+                        )
+                        pl = first.get("payload") or {}
+                        tid = pl.get("id") or pl.get("session_id")
+                    except Exception:
+                        tid = None
+
+                if dry_run:
+                    result.fixed_count += 1
+                    result.details.append(
+                        f"Would quarantine and regenerate {rf.name} (errors: {'; '.join(errs)})"
+                    )
+                    if tid:
+                        repaired_tids.add(tid)
+                    continue
+
+                q_root.mkdir(parents=True, exist_ok=True)
+                q_dst = q_root / rf.name
+                shutil.copy2(rf, q_dst)
+                result.quarantined_files.append(str(q_dst))
+
+                chat = chats_by_id.get(tid) if tid else None
+                if chat is None:
+                    msgs = self._read_rollout_messages(rf)
+                    if msgs and tid:
+                        chat = ChatSession(
+                            tool=self.tool_name,
+                            native_id=tid,
+                            title=msgs[0].text.splitlines()[0][:80],
+                            created_at_ms=msgs[0].timestamp_ms or int(rf.stat().st_mtime * 1000),
+                            updated_at_ms=msgs[-1].timestamp_ms or int(rf.stat().st_mtime * 1000),
+                            messages=msgs,
+                        ).compute_hashes()
+
+                if chat is not None:
+                    self.write_chat(chat, target_native_id=chat.native_id, projects_by_key=projs)
+                    repaired_tids.add(chat.native_id)
+                    if rf.exists() and validate_codex_rollout_file(rf):
+                        rf.unlink(missing_ok=True)
+                    result.fixed_count += 1
+                    result.details.append(f"Quarantined and regenerated conformant rollout: {rf.name}")
+                else:
+                    rf.unlink(missing_ok=True)
+                    result.fixed_count += 1
+                    result.details.append(f"Quarantined unindexed broken rollout: {rf.name}")
+
+        # 5. Rebuild any remaining spinning threads whose state_5 / thread_history metadata is malformed
+        for tid, _rp, reason in self._detect_spinning_threads():
+            if tid in repaired_tids:
                 continue
-
-            tid = path_to_tid.get(path_dedup_key(str(rf)))
-            if not tid:
-                # Fallback: extract session_id from broken line 1
-                try:
-                    first = json.loads(rf.read_text(encoding="utf-8-sig", errors="replace").splitlines()[0])
-                    pl = first.get("payload") or {}
-                    tid = pl.get("id") or pl.get("session_id")
-                except Exception:
-                    tid = None
-
+            chat = chats_by_id.get(tid)
+            if chat is None:
+                continue
             if dry_run:
                 result.fixed_count += 1
-                result.details.append(f"Would quarantine and regenerate {rf.name} (errors: {'; '.join(errs)})")
-                continue
-
-            # Quarantine the broken file first
-            q_root.mkdir(parents=True, exist_ok=True)
-            q_dst = q_root / rf.name
-            shutil.copy2(rf, q_dst)
-            result.quarantined_files.append(str(q_dst))
-
-            chat = chats_by_id.get(tid) if tid else None
-            if chat is None:
-                # Reconstruct minimal ChatSession from broken rollout if unindexed
-                msgs = self._read_rollout_messages(rf)
-                if msgs and tid:
-                    chat = ChatSession(
-                        tool=self.tool_name,
-                        native_id=tid,
-                        title=msgs[0].text.splitlines()[0][:80],
-                        created_at_ms=msgs[0].timestamp_ms or int(rf.stat().st_mtime * 1000),
-                        updated_at_ms=msgs[-1].timestamp_ms or int(rf.stat().st_mtime * 1000),
-                        messages=msgs,
-                    ).compute_hashes()
-
-            if chat is not None:
-                self.write_chat(chat, target_native_id=chat.native_id, projects_by_key=projs)
-                # If write_chat wrote to a canonical path different from rf, remove the old quarantined file
-                if rf.exists() and validate_codex_rollout_file(rf):
-                    rf.unlink(missing_ok=True)
-                result.fixed_count += 1
-                result.details.append(f"Quarantined and regenerated conformant rollout: {rf.name}")
+                result.details.append(
+                    f"Would rebuild Codex hydration metadata for thread '{tid}' ({reason})"
+                )
             else:
-                # Unrecoverable orphan broken file -> remove after quarantining
-                rf.unlink(missing_ok=True)
+                self.write_chat(chat, target_native_id=tid, projects_by_key=projs)
+                repaired_tids.add(tid)
                 result.fixed_count += 1
-                result.details.append(f"Quarantined unindexed broken rollout: {rf.name}")
+                result.details.append(
+                    f"Rebuilt Codex hydration rollout + SQLite indexes for thread '{tid}'"
+                )
 
         return result

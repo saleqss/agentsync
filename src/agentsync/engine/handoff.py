@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from agentsync.adapters.base import ToolAdapter
 from agentsync.config import AgentSyncConfig
 from agentsync.models.canonical import ChatMessage, ChatSession
+from agentsync.state.backup import BackupManager
 from agentsync.state.ledger import HandoffLedgerRecord, LedgerStore
 from agentsync.utils.env_adapt import resolve_vendored_binary
 from agentsync.utils.events import ProgressBus
@@ -45,6 +46,7 @@ class HandoffResult(BaseModel):
     verified_message_count: int = 0
     synced_skills: int = 0
     synced_instructions: bool = False
+    backup_id: str | None = None
     launched_command: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
@@ -61,6 +63,7 @@ class HandoffEngine:
         self.config = config
         self.adapters_by_name = adapters_by_name
         self.ledger = LedgerStore(config)
+        self.backup_mgr = BackupManager(config)
         self.bus = bus
 
     def list_sessions(self, tool_name: str, include_subagents: bool = False) -> list[ChatSession]:
@@ -192,6 +195,19 @@ class HandoffEngine:
         if self.bus:
             self.bus.emit(
                 "handoff",
+                "progress.backup",
+                step_index=0,
+                total_steps=3,
+                percent=15.0,
+                target=target_tool,
+            )
+
+        # Always create a verified SHA-256 pre-write snapshot of the target before mutating it
+        backup_manifest = self.backup_mgr.create_backup([tgt], reason=f"handoff-{source_tool}-to-{target_tool}")
+
+        if self.bus:
+            self.bus.emit(
+                "handoff",
                 "progress.handoff_write",
                 step_index=1,
                 total_steps=3,
@@ -293,6 +309,7 @@ class HandoffEngine:
             verified_message_count=len(verified_chat.messages) if verified_chat else 0,
             synced_skills=synced_skills,
             synced_instructions=synced_instructions,
+            backup_id=backup_manifest.backup_id,
             launched_command=launched,
             warnings=warnings,
         )

@@ -81,6 +81,12 @@ class AgentSyncConfig(BaseModel):
     data_dir: str | None = None
     include_subagents: bool = False
     debounce_seconds: float = Field(default=2.0, ge=0.2, le=60.0)
+    close_grace_seconds: float = Field(default=2.5, ge=0.2, le=30.0)
+    max_backups: int = Field(default=20, ge=1, le=500)
+    max_backup_days: int = Field(default=30, ge=1, le=3650)
+    autostart_enabled: bool = False
+    auto_check_updates: bool = True
+    notifications: bool = False
     tools: dict[str, ToolConfig] = Field(default_factory=dict)
 
     def resolved_data_dir(self) -> Path:
@@ -113,6 +119,14 @@ class AgentSyncConfig(BaseModel):
     @property
     def adapted_skills_path(self) -> Path:
         return self.resolved_data_dir() / "adapted_skills.json"
+
+    @property
+    def daemon_log_path(self) -> Path:
+        return self.resolved_data_dir() / "daemon.log"
+
+    @property
+    def update_cache_path(self) -> Path:
+        return self.resolved_data_dir() / "update_cache.json"
 
     def is_tool_enabled(self, tool_name: str) -> bool:
         tcfg = self.tools.get(tool_name)

@@ -1,0 +1,40 @@
+name: Request New AI Agent Adapter
+description: Request first-class sync & discovery support for another AI coding client
+title: "[Adapter]: "
+labels: ["adapter", "enhancement"]
+body:
+  - type: input
+    id: client_name
+    attributes:
+      label: AI Coding Client Name & URL
+      placeholder: "e.g., Aider / Continue / Goose (https://...)"
+    validations:
+      required: true
+  - type: checkboxes
+    id: entities
+    attributes:
+      label: Entities supported by this client
+      options:
+        - label: Skills (SKILL.md / prompts)
+        - label: MCP Servers (JSON / JSONC / TOML / YAML)
+        - label: Instructions / Rules (AGENTS.md / custom rules)
+        - label: Plugins / Extensions
+        - label: Projects / Workspaces
+        - label: Chat / Session History
+  - type: textarea
+    id: paths
+    attributes:
+      label: Known config & data paths (Windows / macOS / Linux)
+      description: Share real on-disk paths and file formats so the adapter uses zero guesswork.
+      placeholder: |
+        Windows: %USERPROFILE%\.<client>\...
+        macOS: ~/Library/Application Support/...
+        Linux: ~/.config/<client>/...
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: Redacted config sample
+      description: Paste a minimal redacted config snippet (strip any secrets).
+      render: json

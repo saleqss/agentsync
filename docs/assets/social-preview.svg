@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="AgentSync Social Preview">
+  <defs>
+    <linearGradient id="sbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#111b2e"/>
+    </linearGradient>
+    <linearGradient id="sbar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#58a6ff"/>
+      <stop offset="50%" stop-color="#3fb950"/>
+      <stop offset="100%" stop-color="#a371f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#sbg)"/>
+  <rect x="28" y="28" width="1224" height="584" rx="20" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+  <text x="84" y="140" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="76" font-weight="800" fill="#f0f6fc">AGENT<tspan fill="#58a6ff">SYNC</tspan></text>
+  <rect x="84" y="160" width="460" height="6" rx="3" fill="url(#sbar)"/>
+  <text x="84" y="220" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="30" fill="#c9d1d9">Keep skills, MCP servers, rules, projects &amp; chats in sync</text>
+  <text x="84" y="260" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="30" fill="#8b949e">across 11 desktop, IDE, and CLI AI coding agents.</text>
+
+  <!-- Feature pills -->
+  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18" font-weight="700">
+    <rect x="84" y="316" width="250" height="48" rx="10" fill="#0d1117" stroke="#238636" stroke-width="2"/>
+    <text x="209" y="346" text-anchor="middle" fill="#3fb950">WAL-Safe SQLite</text>
+
+    <rect x="354" y="316" width="270" height="48" rx="10" fill="#0d1117" stroke="#1f6feb" stroke-width="2"/>
+    <text x="489" y="346" text-anchor="middle" fill="#79c0ff">Sync-on-Close Daemon</text>
+
+    <rect x="644" y="316" width="255" height="48" rx="10" fill="#0d1117" stroke="#8957e5" stroke-width="2"/>
+    <text x="771" y="346" text-anchor="middle" fill="#d2a8ff">Session Handoff</text>
+
+    <rect x="919" y="316" width="275" height="48" rx="10" fill="#0d1117" stroke="#d29922" stroke-width="2"/>
+    <text x="1056" y="346" text-anchor="middle" fill="#e3b341">Responsive TUI</text>
+  </g>
+
+  <!-- Terminal mock bar -->
+  <rect x="84" y="410" width="1110" height="148" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+  <circle cx="114" cy="436" r="6" fill="#f85149"/>
+  <circle cx="134" cy="436" r="6" fill="#d29922"/>
+  <circle cx="154" cy="436" r="6" fill="#3fb950"/>
+  <text x="184" y="441" font-family="ui-monospace, Consolas, monospace" font-size="14" fill="#8b949e">agentsync v0.4.0 - github.com/saleqss/agentsync</text>
+  <text x="114" y="484" font-family="ui-monospace, Consolas, monospace" font-size="20" fill="#79c0ff">$ uv tool install git+https://github.com/saleqss/agentsync.git</text>
+  <text x="114" y="522" font-family="ui-monospace, Consolas, monospace" font-size="20" fill="#3fb950">$ agentsync   # Launch 8-screen TUI (EN / RU / ZH)  |  agentsync autostart enable</text>
+</svg>

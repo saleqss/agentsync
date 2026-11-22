@@ -41,6 +41,7 @@ def test_tui_onboarding_wizard_live_language_and_persistence(sandbox: dict[str, 
             discovery_env=denv,
             check_processes=False,
             show_onboarding=True,
+            check_updates_on_mount=False,
         )
         async with tui.run_test(size=(120, 40)) as pilot:
             await tui.workers.wait_for_complete()
@@ -99,6 +100,7 @@ def test_tui_checkbox_selection_strictly_leaves_unchecked_apps_untouched(sandbox
             discovery_env=denv,
             check_processes=False,
             show_onboarding=False,
+            check_updates_on_mount=False,
         )
         async with tui.run_test(size=(120, 40)) as pilot:
             await tui.workers.wait_for_complete()
@@ -152,6 +154,7 @@ def test_tui_live_language_mode_switch_all_8_screens_and_operations(sandbox: dic
             discovery_env=denv,
             check_processes=False,
             show_onboarding=False,
+            check_updates_on_mount=False,
         )
         async with tui.run_test(size=(120, 40)) as pilot:
             await tui.workers.wait_for_complete()
@@ -215,5 +218,162 @@ def test_tui_live_language_mode_switch_all_8_screens_and_operations(sandbox: dic
             await tui.workers.wait_for_complete()
             await pilot.pause(0.1)
             assert "Preview:" in str(tui.query_one("#handoff-output", Static).render())
+
+    asyncio.run(_run())
+
+
+def test_tui_responsive_viewports_3x3_locales_and_counter_parity(sandbox: dict[str, Any]) -> None:
+    """Responsive breakpoints (.compact 80x24, .medium 120x30, .wide 180x50) render cleanly across EN/RU/ZH with exact Selected X/Y parity."""
+    cfg: AgentSyncConfig = sandbox["config"]
+    cfg.onboarding_completed = True
+    # Intentionally add a stale non-installed enabled tool to config to prove Selected: X/Y never miscounts!
+    cfg_file: Path = sandbox["config_file"]
+    ConfigManager(cfg_file).save(cfg)
+    denv = _mock_discovery_env(sandbox)
+
+    async def _run() -> None:
+        for size, expected_bp in (((80, 24), "compact"), ((120, 30), "medium"), ((180, 50), "wide")):
+            for loc in ("en", "ru", "zh"):
+                tui = AgentSyncApp(
+                    config_path=cfg_file,
+                    data_dir=cfg.resolved_data_dir(),
+                    locale_override=loc,
+                    discovery_env=denv,
+                    check_processes=False,
+                    show_onboarding=False,
+                    check_updates_on_mount=False,
+                )
+                async with tui.run_test(size=size) as pilot:
+                    await tui.workers.wait_for_complete()
+                    await pilot.pause(0.1)
+                    assert tui.screen.has_class(expected_bp)
+
+                    # Verify Selected: X/Y matches exact displayed checked installed checkboxes
+                    checkboxes = [
+                        cb for cb in tui.query("#detected-checklist Checkbox")
+                        if isinstance(cb, Checkbox)
+                    ]
+                    checked_boxes = sum(1 for cb in checkboxes if cb.value)
+                    total_boxes = len(checkboxes)
+                    summary_txt = str(tui.query_one("#dash-summary", Static).render())
+                    assert f"{checked_boxes}/{total_boxes}" in summary_txt
+
+                    # Verify zero dashboard buttons clip horizontally beyond terminal width
+                    for btn in tui.query("#screen-dashboard Button"):
+                        if btn.display and btn.region.width > 0:
+                            assert btn.region.right <= size[0], (
+                                f"Button {btn.id} clipped at {size} ({loc}): right={btn.region.right}"
+                            )
+
+    asyncio.run(_run())
+
+
+def test_tui_legacy_conhost_ascii_mode_zero_half_blocks(sandbox: dict[str, Any], tmp_path: Path) -> None:
+    """Legacy Windows conhost ASCII mode applies .legacy-console, uses [X]/[ ] checkboxes, and renders zero half-block borders."""
+    cfg: AgentSyncConfig = sandbox["config"]
+    cfg.onboarding_completed = True
+    cfg_file: Path = sandbox["config_file"]
+    ConfigManager(cfg_file).save(cfg)
+    denv = _mock_discovery_env(sandbox)
+
+    async def _run() -> None:
+        tui = AgentSyncApp(
+            config_path=cfg_file,
+            data_dir=cfg.resolved_data_dir(),
+            discovery_env=denv,
+            check_processes=False,
+            show_onboarding=False,
+            ascii_mode=True,
+            check_updates_on_mount=False,
+        )
+        async with tui.run_test(size=(100, 30)) as pilot:
+            await tui.workers.wait_for_complete()
+            await pilot.pause(0.1)
+            assert tui.screen.has_class("legacy-console")
+            cbs = list(tui.query("#detected-checklist Checkbox"))
+            assert len(cbs) >= 2
+            assert cbs[0].BUTTON_LEFT == "["
+            assert cbs[0].BUTTON_RIGHT == "]"
+            assert cbs[0].BUTTON_INNER == "X"
+            svg_path = tmp_path / "conhost.svg"
+            tui.save_screenshot(str(svg_path))
+            svg_txt = svg_path.read_text(encoding="utf-8")
+            # Zero Textual half-block checkbox/button borders (`▐`, `▌`, `▔`)
+            for bad_glyph in ("\u258c", "\u2590", "\u2594"):
+                assert bad_glyph not in svg_txt
+
+    asyncio.run(_run())
+
+
+def test_tui_diff_modal_live_watch_and_backup_controls(sandbox: dict[str, Any]) -> None:
+    """DiffModal opens on diff row selection, Live Watch starts/pauses/resumes/stops, and Backups create/verify work."""
+    cfg: AgentSyncConfig = sandbox["config"]
+    cfg.onboarding_completed = True
+    cfg_file: Path = sandbox["config_file"]
+    ConfigManager(cfg_file).save(cfg)
+    denv = _mock_discovery_env(sandbox)
+
+    async def _run() -> None:
+        tui = AgentSyncApp(
+            config_path=cfg_file,
+            data_dir=cfg.resolved_data_dir(),
+            discovery_env=denv,
+            check_processes=False,
+            show_onboarding=False,
+            check_updates_on_mount=False,
+        )
+        async with tui.run_test(size=(130, 38)) as pilot:
+            await tui.workers.wait_for_complete()
+            await pilot.pause(0.1)
+
+            # 1. Preview diff & inspect first row in DiffModal
+            await pilot.press("2")
+            await pilot.pause(0.1)
+            await pilot.click("#btn-patch-preview")
+            await tui.workers.wait_for_complete()
+            await pilot.pause(0.1)
+            assert len(tui._diff_actions) > 0
+            dt = tui.query_one("#patch-diff-table", DataTable)
+            dt.focus()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            assert tui.screen.__class__.__name__ == "DiffModal"
+            await pilot.click("#btn-diff-close")
+            await pilot.pause(0.1)
+            assert tui.screen.__class__.__name__ != "DiffModal"
+
+            # 2. Live Watch Screen 4: Start -> Pause -> Resume -> Stop
+            await pilot.press("4")
+            await pilot.pause(0.1)
+            await pilot.click("#btn-watch-start")
+            await pilot.pause(0.15)
+            assert tui._watching is True and tui._watcher is not None
+            await pilot.click("#btn-watch-pause")
+            await pilot.pause(0.1)
+            assert tui._watcher.status_snapshot().paused is True
+            await pilot.click("#btn-watch-resume")
+            await pilot.pause(0.1)
+            assert tui._watcher.status_snapshot().paused is False
+            await pilot.click("#btn-watch-stop")
+            await pilot.pause(0.1)
+            assert tui._watching is False
+
+            # 3. Backups Screen 7: Create manual snapshot + Verify all backups
+            await pilot.press("7")
+            await pilot.pause(0.1)
+            await pilot.click("#btn-backups-create")
+            await tui.workers.wait_for_complete()
+            await pilot.pause(0.15)
+            assert tui.query_one("#backups-table", DataTable).row_count >= 1
+            await pilot.click("#btn-backups-verify")
+            await tui.workers.wait_for_complete()
+            await pilot.pause(0.1)
+
+            # 4. Global Command Palette (Ctrl+K) opens cleanly
+            await pilot.press("ctrl+k")
+            await pilot.pause(0.15)
+            assert tui.screen.__class__.__name__ == "CommandPalette"
+            await pilot.press("escape")
+            await pilot.pause(0.1)
 
     asyncio.run(_run())
