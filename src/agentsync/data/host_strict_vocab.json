@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "description": "Host-native tokens that must trigger a strict-vocab warning if found unmapped in another host's instructions or skills.",
+  "host_tokens": {
+    "claude-code": [
+      "NotebookEdit",
+      "EnterPlanMode",
+      "ExitPlanMode",
+      "EnterWorktree",
+      "ExitWorktree",
+      "ScheduleWakeup",
+      "PushNotification",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "AskUserQuestion",
+      "TeamCreate",
+      "TeamDelete",
+      "TaskCreate"
+    ],
+    "codex": [
+      "apply_patch",
+      "spawn_agent",
+      "wait_agent",
+      "exec_command",
+      "update_plan",
+      "workspace-write"
+    ],
+    "antigravity": [
+      "invoke_subagent",
+      "manage_subagents",
+      "define_subagent",
+      "ask_question"
+    ],
+    "zed": [
+      "agent.tool_permissions.terminal",
+      "agent.tool_permissions.edit_file",
+      "context_servers"
+    ]
+  }
+}

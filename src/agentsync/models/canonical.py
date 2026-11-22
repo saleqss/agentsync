@@ -487,6 +487,7 @@ class SyncAction(BaseModel):
     target_tool: str
     entity_id: str
     summary: str
+    risk_level: Literal["low", "medium", "high"] = "low"
     details: dict[str, Any] = Field(default_factory=dict)
 
     def masked(self) -> SyncAction:
@@ -494,11 +495,12 @@ class SyncAction(BaseModel):
 
 
 class SyncPlan(BaseModel):
-    mode: Literal["bootstrap", "sync", "repair"]
+    mode: Literal["bootstrap", "sync", "repair", "patch"]
     dry_run: bool = False
     actions: list[SyncAction] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     backup_id: str | None = None
+    ledger_path: str | None = None
 
     @property
     def mutating_actions(self) -> list[SyncAction]:
@@ -517,7 +519,12 @@ class SyncPlan(BaseModel):
         return len(self.mutating_actions) == 0
 
     def add(self, action: SyncAction) -> None:
-        self.actions.append(action.masked())
+        from agentsync.utils.selectors import classify_action_risk
+
+        risk = action.risk_level
+        if risk == "low":
+            risk = classify_action_risk(action.category, action.action, action.entity_id, action.summary)
+        self.actions.append(action.model_copy(update={"risk_level": risk}).masked())
 
 
 class DoctorIssue(BaseModel):

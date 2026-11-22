@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "description": "Layered bidirectional semantic token, file, and permission mapping across AI coding agents.",
+  "layers": [
+    {
+      "id": "instruction_files",
+      "description": "Canonical instruction file references across hosts.",
+      "rules": [
+        {
+          "id": "project-instructions-file",
+          "claude-code": "CLAUDE.md",
+          "codex": "AGENTS.md",
+          "antigravity": "GEMINI.md",
+          "zed": "AGENTS.md",
+          "opencode": "AGENTS.md",
+          "gemini-cli": "GEMINI.md",
+          "vscode-copilot": ".github/copilot-instructions.md"
+        }
+      ]
+    },
+    {
+      "id": "tools_and_permissions",
+      "description": "Host-specific tool and permission token equivalents.",
+      "rules": [
+        {
+          "id": "file-write-permission",
+          "claude-code": "Write",
+          "codex": "workspace-write",
+          "antigravity": "write_file",
+          "zed": "agent.tool_permissions.edit_file"
+        },
+        {
+          "id": "file-read-permission",
+          "claude-code": "Read",
+          "codex": "read-only",
+          "antigravity": "read_file",
+          "zed": "agent.tool_permissions.read_file"
+        },
+        {
+          "id": "shell-exec-tool",
+          "claude-code": "Bash",
+          "codex": "exec_command",
+          "antigravity": "run_command",
+          "zed": "agent.tool_permissions.terminal"
+        },
+        {
+          "id": "subagent-spawn",
+          "claude-code": "TaskCreate",
+          "codex": "spawn_agent",
+          "antigravity": "invoke_subagent",
+          "zed": "agent.subagent"
+        },
+        {
+          "id": "patch-edit-tool",
+          "claude-code": "Edit",
+          "codex": "apply_patch",
+          "antigravity": "edit_file",
+          "zed": "agent.tool_permissions.edit_file"
+        },
+        {
+          "id": "headless-cli-exec",
+          "claude-code": "claude -p",
+          "codex": "codex exec",
+          "opencode": "opencode run"
+        }
+      ]
+    }
+  ]
+}

@@ -88,6 +88,22 @@ def classify_process(
     if "\\programs\\deepseek harness\\" in lexe:
         return "deepseek-harness"
 
+    # Zed Editor
+    if lname in {"zed.exe", "zed"} or "\\programs\\zed\\" in lexe or "/zed.app/" in lcmd:
+        return "zed"
+
+    # Cursor IDE
+    if lname in {"cursor.exe", "cursor"} or "\\programs\\cursor\\" in lexe:
+        return "cursor"
+
+    # Windsurf IDE
+    if lname in {"windsurf.exe", "windsurf"} or "\\programs\\windsurf\\" in lexe:
+        return "windsurf"
+
+    # Gemini CLI
+    if lname in {"gemini.exe", "gemini"} and "gemini" in (lexe + " " + lcmd):
+        return "gemini-cli"
+
     return None
 
 
