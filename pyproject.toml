@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentsync"
-version = "0.2.0"
-description = "Production-grade bidirectional synchronization CLI for AI coding agents (Codex, Antigravity, Claude Code, OpenCode, DeepSeek Harness)"
+version = "0.3.0"
+description = "Universal cross-platform synchronization, patching, context-handoff, and TUI suite for AI coding agents"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -46,6 +46,7 @@ dependencies = [
     "psutil>=6.0",
     "PyYAML>=6.0",
     "zstandard>=0.23",
+    "textual>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -78,3 +79,4 @@ ignore = ["E501", "B008"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+asyncio_default_fixture_loop_scope = "function"

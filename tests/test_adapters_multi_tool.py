@@ -289,9 +289,15 @@ def test_extensible_adapter_registry_custom_plugin(tmp_path: Path) -> None:
     assert set(builtin.list_names()) == {
         "antigravity",
         "claude-code",
+        "cline",
         "codex",
+        "cursor",
         "deepseek-harness",
+        "gemini-cli",
         "opencode",
+        "vscode-copilot",
+        "windsurf",
+        "zed",
     }
 
     local_reg = AdapterRegistry()
