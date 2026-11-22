@@ -1944,6 +1944,51 @@ class CodexAdapter(ToolAdapter):
                     )
                 )
 
+        # 5. Check duplicate skills between ~/.codex/skills and ~/.agents/skills (anti-duplication trap)
+        agents_skills_dir = self.root_path.parent / ".agents" / "skills"
+        if self.skills_dir.exists() and agents_skills_dir.exists():
+            codex_skill_names = {
+                d.name
+                for d in self.skills_dir.iterdir()
+                if d.is_dir() and not d.name.startswith(".") and (d / "SKILL.md").exists()
+            }
+            agent_skill_names = {
+                d.name
+                for d in agents_skills_dir.iterdir()
+                if d.is_dir() and not d.name.startswith(".") and (d / "SKILL.md").exists()
+            }
+            overlap = sorted(codex_skill_names & agent_skill_names)
+            if overlap:
+                issues.append(
+                    DoctorIssue(
+                        tool=self.tool_name,
+                        severity="warning",
+                        code="CODEX_DUPLICATE_AGENT_SKILL",
+                        path=str(agents_skills_dir),
+                        message=(
+                            f"{len(overlap)} skill(s) exist in both ~/.codex/skills and ~/.agents/skills "
+                            f"({', '.join(overlap[:5])}{'...' if len(overlap) > 5 else ''}), "
+                            "which causes duplicate skill loading in Codex."
+                        ),
+                        fixable=True,
+                    )
+                )
+
+        # 6. Check broken symlinks inside ~/.codex/skills
+        if self.skills_dir.exists():
+            for entry in sorted(self.skills_dir.iterdir()):
+                if entry.is_symlink() and not entry.exists():
+                    issues.append(
+                        DoctorIssue(
+                            tool=self.tool_name,
+                            severity="error",
+                            code="CODEX_BROKEN_SKILL_SYMLINK",
+                            path=str(entry),
+                            message=f"Broken skill symlink '{entry.name}' points to missing target.",
+                            fixable=True,
+                        )
+                    )
+
         return issues
 
     def repair(self, quarantine_dir: Path, dry_run: bool = False) -> RepairResult:
@@ -1961,6 +2006,45 @@ class CodexAdapter(ToolAdapter):
                 if changed:
                     result.fixed_count += 1
                     result.details.append("Collapsed duplicate project rows in state_5.sqlite")
+
+        # Clean broken symlinks inside ~/.codex/skills
+        if self.skills_dir.exists():
+            for entry in sorted(self.skills_dir.iterdir()):
+                if entry.is_symlink() and not entry.exists():
+                    if dry_run:
+                        result.fixed_count += 1
+                        result.details.append(f"Would remove dangling Codex skill symlink '{entry.name}'")
+                    else:
+                        entry.unlink(missing_ok=True)
+                        result.fixed_count += 1
+                        result.details.append(f"Removed dangling Codex skill symlink '{entry.name}'")
+
+        # Deduplicate overlapping skills between ~/.codex/skills and ~/.agents/skills
+        agents_skills_dir = self.root_path.parent / ".agents" / "skills"
+        if self.skills_dir.exists() and agents_skills_dir.exists():
+            codex_names = {
+                d.name
+                for d in self.skills_dir.iterdir()
+                if d.is_dir() and not d.name.startswith(".") and (d / "SKILL.md").exists()
+            }
+            for adir in sorted(agents_skills_dir.iterdir()):
+                if adir.is_dir() and adir.name in codex_names and (adir / "SKILL.md").exists():
+                    if dry_run:
+                        result.fixed_count += 1
+                        result.details.append(
+                            f"Would quarantine duplicate ~/.agents/skills/{adir.name} (already in ~/.codex/skills)"
+                        )
+                    else:
+                        ts_dup = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+                        q_dup = quarantine_dir / f"{ts_dup}_agents_skills_dup" / adir.name
+                        q_dup.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copytree(adir, q_dup, dirs_exist_ok=True)
+                        remove_tree_if_exists(adir)
+                        result.quarantined_files.append(str(q_dup))
+                        result.fixed_count += 1
+                        result.details.append(
+                            f"Quarantined duplicate ~/.agents/skills/{adir.name} to prevent double-loading in Codex"
+                        )
 
         if not self.sessions_dir.exists():
             return result

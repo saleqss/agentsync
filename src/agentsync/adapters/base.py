@@ -49,6 +49,7 @@ class ToolAdapter:
 
     tool_name: str = ""
     display_name: str = ""
+    client_kind: Literal["desktop", "cli", "ide", "both"] = "both"
     capabilities: ToolCapabilities = ToolCapabilities()
 
     def __init__(self, tool_config: ToolConfig) -> None:

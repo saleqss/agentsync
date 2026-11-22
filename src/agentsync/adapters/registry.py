@@ -59,9 +59,15 @@ def _load_builtin_adapters() -> None:
     from agentsync.adapters import (  # noqa: F401
         antigravity,
         claude_code,
+        cline,
         codex,
+        cursor,
         deepseek_harness,
+        gemini_cli,
         opencode,
+        vscode_copilot,
+        windsurf,
+        zed,
     )
 
     _BUILTINS_LOADED = True

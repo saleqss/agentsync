@@ -22,6 +22,7 @@ from agentsync.models.canonical import (
     McpTransport,
     PluginItem,
     ProjectItem,
+    RepairResult,
     SkillItem,
     ensure_skill_frontmatter,
     parse_skill_md,
@@ -176,6 +177,27 @@ class ClaudeCodeAdapter(ToolAdapter):
                     updated_at_ms=int(cf.stat().st_mtime * 1000),
                     source_tool=self.tool_name,
                     synthesized_frontmatter=True,
+                ).compute_hashes()
+
+        # Also read cached plugin skills (~/.claude/plugins/cache/*/*/*/skills/*)
+        plugin_cache = self.plugins_dir / "cache"
+        if plugin_cache.exists():
+            for sk_md in sorted(plugin_cache.rglob("SKILL.md")):
+                sk_dir = sk_md.parent
+                sname = sk_dir.name
+                if sname.startswith(".") or sname in result:
+                    continue
+                files, mtime_ms = _read_dir_files(sk_dir)
+                md = files["SKILL.md"].decode("utf-8", errors="replace")
+                fm, _, had_fm = parse_skill_md(md, sname)
+                result[sname] = SkillItem(
+                    name=sname,
+                    frontmatter_name=str(fm.get("name") or sname),
+                    description=str(fm.get("description") or ""),
+                    files=files,
+                    updated_at_ms=mtime_ms,
+                    source_tool=self.tool_name,
+                    synthesized_frontmatter=not had_fm,
                 ).compute_hashes()
         return result
 
@@ -644,4 +666,51 @@ class ClaudeCodeAdapter(ToolAdapter):
                             )
                         )
                         break
+        if self.skills_dir.exists():
+            for entry in sorted(self.skills_dir.iterdir()):
+                if entry.is_symlink() and not entry.exists():
+                    issues.append(
+                        DoctorIssue(
+                            tool=self.tool_name,
+                            severity="error",
+                            code="CLAUDE_BROKEN_SKILL_SYMLINK",
+                            path=str(entry),
+                            message=f"Broken skill symlink '{entry.name}' (likely stale after plugin version bump).",
+                            fixable=True,
+                        )
+                    )
         return issues
+
+    def repair(self, quarantine_dir: Path, dry_run: bool = False) -> RepairResult:
+        res = RepairResult(tool=self.tool_name)
+        if not self.skills_dir.exists():
+            return res
+        cache_targets: dict[str, Path] = {}
+        plugin_cache = self.plugins_dir / "cache"
+        if plugin_cache.exists():
+            for sk_md in sorted(plugin_cache.rglob("SKILL.md")):
+                cache_targets[sk_md.parent.name] = sk_md.parent
+
+        for entry in sorted(self.skills_dir.iterdir()):
+            if entry.is_symlink() and not entry.exists():
+                healed_target = cache_targets.get(entry.name)
+                if dry_run:
+                    res.fixed_count += 1
+                    msg = (
+                        f"Would relink broken symlink '{entry.name}' -> {healed_target}"
+                        if healed_target
+                        else f"Would remove dangling symlink '{entry.name}'"
+                    )
+                    res.details.append(msg)
+                else:
+                    entry.unlink(missing_ok=True)
+                    if healed_target:
+                        from agentsync.utils.env_adapt import link_or_copy_skill_dir
+
+                        files, _ = _read_dir_files(healed_target)
+                        link_or_copy_skill_dir(healed_target, entry, files, mode="auto")
+                        res.details.append(f"Healed broken symlink '{entry.name}' -> {healed_target}")
+                    else:
+                        res.details.append(f"Removed dangling skill symlink '{entry.name}'")
+                    res.fixed_count += 1
+        return res

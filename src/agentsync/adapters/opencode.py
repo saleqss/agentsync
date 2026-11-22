@@ -33,6 +33,8 @@ from agentsync.utils.atomic_io import (
     sqlite_safe_connect,
     sync_directory_files,
 )
+from agentsync.utils.env_vars import translate_env_vars_for_tool
+from agentsync.utils.jsonc import loads_jsonc, patch_jsonc_file
 from agentsync.utils.paths import normalize_path, path_dedup_key
 
 _IGNORED_DIR_NAMES = {".git", "__pycache__", "node_modules", ".DS_Store"}
@@ -134,14 +136,23 @@ class OpenCodeAdapter(ToolAdapter):
         return [p for p in (self.root_path, self.data_dir) if p.exists()]
 
     def _load_opencode_json(self) -> tuple[dict[str, Any], int]:
-        if not self.opencode_json.exists():
+        cfg_path = self.opencode_json
+        if not cfg_path.exists() and (self.root_path / "opencode.jsonc").exists():
+            cfg_path = self.root_path / "opencode.jsonc"
+        if not cfg_path.exists():
             return {}, 0
-        txt = self.opencode_json.read_text(encoding="utf-8-sig").strip()
-        mtime_ms = int(self.opencode_json.stat().st_mtime * 1000)
-        return (json.loads(txt) if txt else {}), mtime_ms
+        txt = cfg_path.read_text(encoding="utf-8-sig").strip()
+        mtime_ms = int(cfg_path.stat().st_mtime * 1000)
+        parsed = loads_jsonc(txt) if txt else {}
+        return (parsed if isinstance(parsed, dict) else {}), mtime_ms
 
-    def _save_opencode_json(self, data: dict[str, Any]) -> bool:
-        return atomic_write_json(self.opencode_json, data)
+    def _save_opencode_json(self, data: dict[str, Any], *, mcp_only: bool = False) -> bool:
+        cfg_path = self.opencode_json
+        if not cfg_path.exists() and (self.root_path / "opencode.jsonc").exists():
+            cfg_path = self.root_path / "opencode.jsonc"
+        if mcp_only and cfg_path.exists():
+            return patch_jsonc_file(cfg_path, {"mcp": data.get("mcp", {})})
+        return atomic_write_json(cfg_path, data)
 
     def _ensure_db(self) -> sqlite3.Connection:
         conn = sqlite_safe_connect(self.opencode_db, readonly=False)
@@ -198,11 +209,16 @@ class OpenCodeAdapter(ToolAdapter):
             if not url:
                 return None
             transport: McpTransport = "sse" if url.rstrip("/").lower().endswith("/sse") else "http"
+            headers = translate_env_vars_for_tool(
+                {str(k): str(v) for k, v in (entry.get("headers") or {}).items()},
+                self.tool_name,
+                to_canonical=True,
+            )
             return McpServer(
                 name=name,
                 transport=transport,
                 url=url,
-                headers={str(k): str(v) for k, v in (entry.get("headers") or {}).items()},
+                headers=headers,
                 disabled=entry.get("enabled") is False,
                 portable=True,
                 source_tool=self.tool_name,
@@ -217,13 +233,18 @@ class OpenCodeAdapter(ToolAdapter):
             args = [str(a) for a in (entry.get("args") or [])]
         else:
             return None
-        env = entry.get("environment") or entry.get("env") or {}
+        env_raw = entry.get("environment") or entry.get("env") or {}
+        env = translate_env_vars_for_tool(
+            {str(k): str(v) for k, v in env_raw.items()},
+            self.tool_name,
+            to_canonical=True,
+        )
         return McpServer(
             name=name,
             transport="stdio",
             command=cmd,
             args=args,
-            env={str(k): str(v) for k, v in env.items()},
+            env=env,
             disabled=entry.get("enabled") is False,
             portable=True,
             source_tool=self.tool_name,
@@ -271,7 +292,7 @@ class OpenCodeAdapter(ToolAdapter):
                     "enabled": not srv.disabled,
                 }
                 if srv.env:
-                    entry["environment"] = dict(srv.env)
+                    entry["environment"] = translate_env_vars_for_tool(dict(srv.env), self.tool_name)
                 out_servers[name] = entry
             else:
                 if not srv.url:
@@ -282,12 +303,12 @@ class OpenCodeAdapter(ToolAdapter):
                     "enabled": not srv.disabled,
                 }
                 if srv.headers:
-                    entry["headers"] = dict(srv.headers)
+                    entry["headers"] = translate_env_vars_for_tool(dict(srv.headers), self.tool_name)
                 out_servers[name] = entry
 
         mcp_root["servers"] = out_servers
         data["mcp"] = mcp_root
-        return self._save_opencode_json(data), []
+        return self._save_opencode_json(data, mcp_only=True), []
 
     # --- 4. Instructions ---
 
@@ -580,7 +601,7 @@ class OpenCodeAdapter(ToolAdapter):
                     )
                 )
             try:
-                json.loads(raw.decode("utf-8-sig"))
+                loads_jsonc(raw.decode("utf-8-sig"))
             except Exception as exc:
                 issues.append(
                     DoctorIssue(

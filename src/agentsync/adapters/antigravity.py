@@ -293,6 +293,7 @@ class AntigravityAdapter(ToolAdapter):
 
     tool_name = "antigravity"
     display_name = "Google Antigravity"
+    client_kind = "desktop"
     capabilities = ToolCapabilities(
         skills=True,
         mcp=True,

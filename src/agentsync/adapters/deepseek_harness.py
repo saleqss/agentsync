@@ -54,6 +54,7 @@ class DeepSeekHarnessAdapter(ToolAdapter):
 
     tool_name = "deepseek-harness"
     display_name = "DeepSeek Harness"
+    client_kind = "desktop"
     capabilities = ToolCapabilities(
         skills=False,
         mcp=False,

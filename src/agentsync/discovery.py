@@ -1,4 +1,4 @@
-"""Cross-platform auto-discovery for installed AI coding agents."""
+"""Cross-platform auto-discovery for all desktop, IDE, and terminal AI coding agents."""
 
 from __future__ import annotations
 
@@ -6,10 +6,13 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from agentsync.config import AgentSyncConfig, EntityType, ToolConfig
+from agentsync.utils.env_adapt import resolve_vendored_binary
+from agentsync.utils.events import ProgressBus
 
 
 class DiscoveredTool(BaseModel):
@@ -17,6 +20,7 @@ class DiscoveredTool(BaseModel):
 
     name: str
     display_name: str
+    client_kind: Literal["desktop", "cli", "ide", "both"] = "both"
     installed: bool = False
     root_path: str | None = None
     extra_paths: dict[str, str] = Field(default_factory=dict)
@@ -36,6 +40,7 @@ class DiscoveryEnv(BaseModel):
     xdg_config_home: Path | None = None
     xdg_data_home: Path | None = None
     env: dict[str, str] = Field(default_factory=dict)
+    probe_system_binaries: bool = False
 
     @classmethod
     def from_os(cls) -> DiscoveryEnv:
@@ -52,20 +57,25 @@ class DiscoveryEnv(BaseModel):
             xdg_config_home=Path(xdg_cfg) if xdg_cfg else (home / ".config"),
             xdg_data_home=Path(xdg_data) if xdg_data else (home / ".local" / "share"),
             env=dict(os.environ),
+            probe_system_binaries=True,
         )
 
-    def which(self, names: tuple[str, ...]) -> str | None:
+    def which(self, names: tuple[str, ...], tool_name: str | None = None) -> str | None:
+        if not self.probe_system_binaries:
+            return None
         for name in names:
             found = shutil.which(name)
             if found:
                 return found
+        if tool_name:
+            return resolve_vendored_binary(tool_name)
         return None
 
 
 def _discover_codex(denv: DiscoveryEnv) -> DiscoveredTool:
     env_home = denv.env.get("CODEX_HOME")
     root = Path(env_home) if env_home else (denv.home / ".codex")
-    exe = denv.which(("codex", "codex.exe"))
+    exe = denv.which(("codex", "codex.exe"), "codex")
     if not exe and denv.platform == "win32" and denv.local_appdata:
         bin_root = denv.local_appdata / "OpenAI" / "Codex" / "bin"
         if bin_root.exists():
@@ -77,6 +87,7 @@ def _discover_codex(denv: DiscoveryEnv) -> DiscoveredTool:
     return DiscoveredTool(
         name="codex",
         display_name="OpenAI Codex",
+        client_kind="both",
         installed=installed,
         root_path=str(root),
         executable=exe,
@@ -96,7 +107,7 @@ def _discover_antigravity(denv: DiscoveryEnv) -> DiscoveredTool:
     else:
         appdata = (denv.xdg_config_home or (denv.home / ".config")) / "Antigravity"
 
-    exe = denv.which(("agy", "antigravity", "Antigravity.exe"))
+    exe = denv.which(("agy", "antigravity", "Antigravity.exe"), "antigravity")
     if not exe and denv.platform == "win32" and denv.local_appdata:
         cand = denv.local_appdata / "Programs" / "Antigravity" / "Antigravity.exe"
         if cand.exists():
@@ -107,6 +118,7 @@ def _discover_antigravity(denv: DiscoveryEnv) -> DiscoveredTool:
     return DiscoveredTool(
         name="antigravity",
         display_name="Google Antigravity",
+        client_kind="desktop",
         installed=installed,
         root_path=str(root),
         extra_paths={"appdata": str(appdata)},
@@ -121,19 +133,20 @@ def _discover_claude_code(denv: DiscoveryEnv) -> DiscoveredTool:
     env_home = denv.env.get("CLAUDE_CONFIG_DIR")
     root = Path(env_home) if env_home else (denv.home / ".claude")
     claude_json = denv.home / ".claude.json"
-    exe = denv.which(("claude", "claude.exe"))
+    exe = denv.which(("claude", "claude.exe"), "claude-code")
     installed = root.exists() or claude_json.exists() or exe is not None
     entities: list[EntityType] = ["projects", "instructions", "skills", "mcp", "plugins", "chats"]
     return DiscoveredTool(
         name="claude-code",
         display_name="Claude Code",
+        client_kind="both",
         installed=installed,
         root_path=str(root),
         extra_paths={"claude_json": str(claude_json)},
         executable=exe,
         supported_entities=list(entities),
         writable_entities=list(entities),
-        notes="~/.claude.json MCPs, CLAUDE.md rules, skills/commands, JSONL project sessions",
+        notes="~/.claude.json MCPs, CLAUDE.md rules, personal + plugin-cache skills, JSONL sessions",
     )
 
 
@@ -142,11 +155,10 @@ def _discover_opencode(denv: DiscoveryEnv) -> DiscoveredTool:
     cfg_root = Path(env_cfg) if env_cfg else ((denv.xdg_config_home or (denv.home / ".config")) / "opencode")
     data_root = (denv.xdg_data_home or (denv.home / ".local" / "share")) / "opencode"
     if denv.platform == "win32" and not data_root.exists():
-        # OpenCode on Windows stores SQLite under %USERPROFILE%\.local\share\opencode
         win_local_share = denv.home / ".local" / "share" / "opencode"
         if win_local_share.exists():
             data_root = win_local_share
-    exe = denv.which(("opencode", "opencode.exe"))
+    exe = denv.which(("opencode", "opencode.exe"), "opencode")
     desktop_dir = (denv.appdata / "ai.opencode.desktop") if denv.appdata else None
     installed = (
         cfg_root.exists()
@@ -158,20 +170,21 @@ def _discover_opencode(denv: DiscoveryEnv) -> DiscoveredTool:
     return DiscoveredTool(
         name="opencode",
         display_name="OpenCode",
+        client_kind="both",
         installed=installed,
         root_path=str(cfg_root),
         extra_paths={"data_dir": str(data_root)},
         executable=exe,
         supported_entities=list(entities),
         writable_entities=list(entities),
-        notes="opencode.json MCPs, AGENTS.md, commands/skills, SQLite opencode.db sessions",
+        notes="JSONC opencode.json ({env:VAR}), AGENTS.md, skills, SQLite opencode.db sessions",
     )
 
 
 def _discover_deepseek_harness(denv: DiscoveryEnv) -> DiscoveredTool:
     env_home = denv.env.get("DSH_HOME") or denv.env.get("DEEPSEEK_HARNESS_HOME")
     root = Path(env_home) if env_home else (denv.home / ".dsh")
-    exe = denv.which(("dsh", "dsh.exe", "deepseek-harness"))
+    exe = denv.which(("dsh", "dsh.exe", "deepseek-harness"), "deepseek-harness")
     if not exe and denv.platform == "win32" and denv.local_appdata:
         cand = denv.local_appdata / "Programs" / "DeepSeek Harness" / "DeepSeek Harness.exe"
         if cand.exists():
@@ -180,17 +193,144 @@ def _discover_deepseek_harness(denv: DiscoveryEnv) -> DiscoveredTool:
     return DiscoveredTool(
         name="deepseek-harness",
         display_name="DeepSeek Harness",
+        client_kind="desktop",
         installed=installed,
         root_path=str(root),
         executable=exe,
         supported_entities=["projects", "instructions", "chats"],
         writable_entities=["projects", "instructions"],
-        notes="workspace.json projects, AGENTS.md rules, zstd v4 session reader (chat write disabled until multi-turn native schema verified)",
+        notes="workspace.json projects, AGENTS.md rules, zstd v4 session reader (chats read-only)",
     )
 
 
-def discover_tools(denv: DiscoveryEnv | None = None) -> dict[str, DiscoveredTool]:
-    """Scan standard OS paths, env vars, and PATH for all registered tools."""
+def _discover_zed(denv: DiscoveryEnv) -> DiscoveredTool:
+    if denv.platform == "win32":
+        root = (denv.appdata or (denv.home / "AppData" / "Roaming")) / "Zed"
+    else:
+        root = (denv.xdg_config_home or (denv.home / ".config")) / "zed"
+    skills_dir = denv.home / ".agents" / "skills"
+    exe = denv.which(("zed", "zed.exe"), "zed")
+    installed = root.exists() or exe is not None
+    entities: list[EntityType] = ["instructions", "skills", "mcp"]
+    return DiscoveredTool(
+        name="zed",
+        display_name="Zed Editor",
+        client_kind="ide",
+        installed=installed,
+        root_path=str(root),
+        extra_paths={"skills_dir": str(skills_dir)},
+        executable=exe,
+        supported_entities=list(entities),
+        writable_entities=list(entities),
+        notes="JSONC settings.json context_servers, agent.tool_permissions, AGENTS.md/.rules, ~/.agents/skills",
+    )
+
+
+def _discover_gemini_cli(denv: DiscoveryEnv) -> DiscoveredTool:
+    root = denv.home / ".gemini"
+    settings_json = root / "settings.json"
+    exe = denv.which(("gemini", "gemini.cmd"), "gemini-cli")
+    installed = settings_json.exists() or exe is not None
+    entities: list[EntityType] = ["instructions", "skills", "mcp"]
+    return DiscoveredTool(
+        name="gemini-cli",
+        display_name="Gemini CLI",
+        client_kind="cli",
+        installed=installed,
+        root_path=str(root),
+        executable=exe,
+        supported_entities=list(entities),
+        writable_entities=list(entities),
+        notes="~/.gemini/settings.json MCP servers, GEMINI.md, ~/.gemini/skills",
+    )
+
+
+def _discover_cursor(denv: DiscoveryEnv) -> DiscoveredTool:
+    root = denv.home / ".cursor"
+    exe = denv.which(("cursor", "Cursor.exe"), "cursor")
+    installed = root.exists() or exe is not None
+    entities: list[EntityType] = ["instructions", "skills", "mcp"]
+    return DiscoveredTool(
+        name="cursor",
+        display_name="Cursor",
+        client_kind="ide",
+        installed=installed,
+        root_path=str(root),
+        executable=exe,
+        supported_entities=list(entities),
+        writable_entities=list(entities),
+        notes="~/.cursor/mcp.json (${env:VAR}), .cursor/rules/*.mdc, ~/.cursor/skills",
+    )
+
+
+def _discover_windsurf(denv: DiscoveryEnv) -> DiscoveredTool:
+    root = denv.home / ".codeium" / "windsurf"
+    exe = denv.which(("windsurf", "Windsurf.exe"), "windsurf")
+    installed = root.exists() or exe is not None
+    entities: list[EntityType] = ["instructions", "mcp"]
+    return DiscoveredTool(
+        name="windsurf",
+        display_name="Windsurf",
+        client_kind="ide",
+        installed=installed,
+        root_path=str(root),
+        executable=exe,
+        supported_entities=list(entities),
+        writable_entities=list(entities),
+        notes="~/.codeium/windsurf/mcp_config.json, .windsurfrules",
+    )
+
+
+def _discover_cline(denv: DiscoveryEnv) -> DiscoveredTool:
+    if denv.platform == "win32":
+        code_user = (denv.appdata or (denv.home / "AppData" / "Roaming")) / "Code" / "User"
+    elif denv.platform == "darwin":
+        code_user = denv.home / "Library" / "Application Support" / "Code" / "User"
+    else:
+        code_user = (denv.xdg_config_home or (denv.home / ".config")) / "Code" / "User"
+    root = code_user / "globalStorage" / "saoudrizwan.claude-dev"
+    installed = root.exists()
+    entities: list[EntityType] = ["instructions", "mcp"]
+    return DiscoveredTool(
+        name="cline",
+        display_name="Cline",
+        client_kind="ide",
+        installed=installed,
+        root_path=str(root),
+        supported_entities=list(entities),
+        writable_entities=list(entities),
+        notes="VS Code globalStorage cline_mcp_settings.json, .clinerules",
+    )
+
+
+def _discover_vscode_copilot(denv: DiscoveryEnv) -> DiscoveredTool:
+    if denv.platform == "win32":
+        root = (denv.appdata or (denv.home / "AppData" / "Roaming")) / "Code" / "User"
+    elif denv.platform == "darwin":
+        root = denv.home / "Library" / "Application Support" / "Code" / "User"
+    else:
+        root = (denv.xdg_config_home or (denv.home / ".config")) / "Code" / "User"
+    exe = denv.which(("code", "code.cmd", "Code.exe"), "vscode-copilot")
+    installed = (root / "mcp.json").exists() or (root.exists() and exe is not None)
+    entities: list[EntityType] = ["instructions", "mcp"]
+    return DiscoveredTool(
+        name="vscode-copilot",
+        display_name="VS Code / Copilot",
+        client_kind="ide",
+        installed=installed,
+        root_path=str(root),
+        executable=exe,
+        supported_entities=list(entities),
+        writable_entities=list(entities),
+        notes="JSONC Code/User/mcp.json (${env:VAR}), .github/copilot-instructions.md",
+    )
+
+
+def discover_tools(
+    denv: DiscoveryEnv | None = None,
+    bus: ProgressBus | None = None,
+) -> dict[str, DiscoveredTool]:
+    """Scan standard OS paths, env vars, app containers, and PATH for all registered tools."""
     env = denv or DiscoveryEnv.from_os()
     detectors = (
         _discover_codex,
@@ -198,11 +338,42 @@ def discover_tools(denv: DiscoveryEnv | None = None) -> dict[str, DiscoveredTool
         _discover_claude_code,
         _discover_opencode,
         _discover_deepseek_harness,
+        _discover_zed,
+        _discover_gemini_cli,
+        _discover_cursor,
+        _discover_windsurf,
+        _discover_cline,
+        _discover_vscode_copilot,
     )
     discovered: dict[str, DiscoveredTool] = {}
-    for fn in detectors:
+    total = len(detectors)
+    for idx, fn in enumerate(detectors, start=1):
+        if bus:
+            bus.check_cancelled()
         item = fn(env)
         discovered[item.name] = item
+        if bus:
+            bus.emit(
+                "discover",
+                "progress.scanning",
+                step_index=idx,
+                total_steps=total,
+                item_name=item.display_name,
+                tool=item.display_name,
+                step=idx,
+                total=total,
+            )
+    if bus:
+        installed_cnt = sum(1 for d in discovered.values() if d.installed)
+        bus.emit(
+            "discover",
+            "progress.scan_done",
+            step_index=total,
+            total_steps=total,
+            percent=100.0,
+            level="success",
+            detected=installed_cnt,
+        )
     return discovered
 
 
