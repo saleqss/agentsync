@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import webbrowser
 from collections import Counter
 from pathlib import Path
@@ -13,10 +14,12 @@ from rich.panel import Panel
 from rich.table import Table
 
 from agentsync import __version__
+from agentsync.accel import runtime_engine_label
 from agentsync.adapters.base import ToolAdapter
 from agentsync.adapters.registry import get_registry
 from agentsync.config import (
     ALL_ENTITIES,
+    EDITABLE_CONFIG_KEYS,
     AgentSyncConfig,
     ConfigManager,
     EntityType,
@@ -24,12 +27,28 @@ from agentsync.config import (
     SyncOptions,
     SyncScope,
     ToolConfig,
+    set_config_setting,
+)
+from agentsync.daemon import (
+    read_daemon_status,
+    restart_daemon,
+    run_daemon_loop,
+    send_daemon_command,
+    start_daemon_background,
+    stop_daemon,
 )
 from agentsync.discovery import discover_tools, merge_discovery_into_config
-from agentsync.engine.autostart import autostart_status, disable_autostart, enable_autostart
+from agentsync.engine.autostart import (
+    autostart_status,
+    detect_split_installations,
+    disable_autostart,
+    enable_autostart,
+    purge_legacy_autostart_artifacts,
+)
 from agentsync.engine.board import generate_inventory_board
 from agentsync.engine.bootstrap import BootstrapEngine
 from agentsync.engine.bundle import export_profile_bundle, import_profile_bundle
+from agentsync.engine.diagnostics import DiagnosticsEngine, load_repair_queue
 from agentsync.engine.doctor import DoctorEngine
 from agentsync.engine.handoff import HandoffEngine, LaunchMode
 from agentsync.engine.patch import PatchEngine
@@ -57,12 +76,16 @@ app = typer.Typer(
 )
 tools_app = typer.Typer(help="Manage enabled AI tools, paths, and per-tool entity filters.")
 workspace_app = typer.Typer(help="Unified project workspace instruction & shared context synchronization.")
-autostart_app = typer.Typer(help="Configure unattended background Sync-on-Close autostart on login.")
+autostart_app = typer.Typer(help="Configure native windowless background autostart on login.")
+daemon_app = typer.Typer(help="Control the single-instance background synchronization daemon (agentsyncw).")
+config_app = typer.Typer(help="Inspect and modify AgentSync settings with live daemon hot-reload.")
 bundle_app = typer.Typer(help="Export or import Portable Profile Bundles (.zip) with SHA-256 verification.")
 backup_app = typer.Typer(help="Create manual verified snapshots and verify backup SHA-256 + SQLite integrity.")
 app.add_typer(tools_app, name="tools")
 app.add_typer(workspace_app, name="workspace")
 app.add_typer(autostart_app, name="autostart")
+app.add_typer(daemon_app, name="daemon")
+app.add_typer(config_app, name="config")
 app.add_typer(bundle_app, name="bundle")
 app.add_typer(backup_app, name="backup")
 console = Console()
@@ -699,15 +722,33 @@ def cmd_doctor(
     fix: bool = typer.Option(False, "--fix", help="Quarantine and repair fixable issues automatically."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview repairs without modifying disk."),
     force: bool = typer.Option(False, "--force", help="Ignore running application lock guard when fixing."),
+    verify_backups: bool = typer.Option(
+        False,
+        "--verify-backups",
+        help="Also run SHA-256 and SQLite PRAGMA integrity_check on stored backups.",
+    ),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Validate configs, JSONC/TOML syntax, SQLite/protobuf stores, symlinks, and rollout schemas."""
-    _, cfg = _load_effective_config(config_file, data_dir)
+    """Validate configs, SQLite/protobuf stores, autostart integrity, daemon health, and split installs."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
     adapters = _build_adapters(cfg)
-    doc_engine = DoctorEngine(cfg, adapters)
+    diag = DiagnosticsEngine(cfg, adapters, config_path=mgr.config_path)
+    report = diag.run_all(verify_backups=verify_backups)
 
-    issues = doc_engine.diagnose()
+    auto_state = (
+        "enabled (healthy)"
+        if (report.autostart_enabled and report.autostart_healthy)
+        else ("enabled (UNHEALTHY)" if report.autostart_enabled else "disabled")
+    )
+    daemon_state = "running" if report.daemon_running else "stopped"
+    console.print(
+        f"[dim]Runtime Engine: {report.runtime_engine} | Autostart: {auto_state} | "
+        f"Daemon: {daemon_state} | Backups: {report.backup_count} | "
+        f"Pending repairs: {report.pending_repairs}[/dim]"
+    )
+
+    issues = report.issues
     if not issues:
         console.print("[green]Doctor check passed: 0 issues detected across all enabled tools.[/green]")
         return
@@ -732,10 +773,34 @@ def cmd_doctor(
     console.print(tbl)
 
     if fix:
+        # 1. Repair agentsync-internal issues (legacy autostart, stale daemon lock)
+        internal_codes = {i.code for i in issues if i.tool == "agentsync" and i.fixable}
+        if "AUTOSTART_LEGACY_OR_BROKEN" in internal_codes:
+            purged = purge_legacy_autostart_artifacts(cfg, dry_run=dry_run)
+            for line in purged:
+                console.print(f"[green]agentsync:[/green] {mask_text(line)}")
+            if cfg.autostart_enabled and not dry_run:
+                try:
+                    st = enable_autostart(cfg, config_path=mgr.config_path, data_dir=data_dir)
+                    console.print(f"[green]agentsync:[/green] Re-registered native autostart ({st.executable})")
+                except Exception as exc:
+                    console.print(f"[yellow]agentsync:[/yellow] Autostart re-registration note: {exc}")
+        if "DAEMON_STALE_LOCK" in internal_codes and cfg.daemon_lock_path.exists():
+            if dry_run:
+                console.print(f"[yellow]agentsync:[/yellow] Would remove stale lock {cfg.daemon_lock_path}")
+            else:
+                cfg.daemon_lock_path.unlink(missing_ok=True)
+                console.print("[green]agentsync:[/green] Removed stale daemon lockfile.")
+
+        # 2. Repair tool-specific adapter issues (SQLite DBs, rollouts, configs, indexes)
+        doc_engine = DoctorEngine(cfg, adapters)
         try:
             results, backup_id = doc_engine.repair(dry_run=dry_run, force=force)
         except AppsRunningError as exc:
             console.print(f"[bold red]Error:[/bold red] {exc}")
+            console.print(
+                "[yellow]Tip: run 'agentsync repair --on-close' to auto-heal safely 2.5s after apps exit.[/yellow]"
+            )
             raise typer.Exit(code=1) from exc
         if backup_id:
             console.print(f"[cyan]Pre-repair backup created: {backup_id}[/cyan]")
@@ -753,10 +818,46 @@ def cmd_doctor(
 def cmd_repair(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview repairs without writing to disk."),
     force: bool = typer.Option(False, "--force", help="Ignore running application lock guard."),
+    on_close: bool = typer.Option(
+        False,
+        "--on-close",
+        help="Queue fixable issues in repair_queue.json so the daemon auto-heals 2.5s after apps exit.",
+    ),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Quarantine and regenerate broken rollouts, symlinks, and out-of-sync summary indexes."""
+    """Quarantine and regenerate broken rollouts, symlinks, autostart tasks, and out-of-sync indexes."""
+    if on_close:
+        mgr, cfg = _load_effective_config(config_file, data_dir)
+        adapters = _build_adapters(cfg)
+        diag = DiagnosticsEngine(cfg, adapters, config_path=mgr.config_path)
+        report = diag.run_all(verify_backups=False)
+        fixable = [i for i in report.issues if i.fixable]
+        if not fixable:
+            console.print("[green]No fixable issues to queue for repair on close.[/green]")
+            return
+        if dry_run:
+            console.print(
+                f"[yellow](DRY-RUN) Would queue {len(fixable)} fixable issue(s) to {cfg.repair_queue_path}:[/yellow]"
+            )
+            for iss in fixable:
+                console.print(f"  - [{iss.tool}] {iss.code}: {mask_text(iss.message)}")
+            return
+        queue = diag.queue_repairs_on_close(fixable)
+        notified = send_daemon_command(cfg, "repair_queued")
+        console.print(
+            f"[green]Queued {len(queue.entries)} repair(s) in {cfg.repair_queue_path}.[/green]"
+        )
+        if notified:
+            console.print(
+                "[cyan]Background daemon notified: repairs will execute automatically 2.5s after locking apps close.[/cyan]"
+            )
+        else:
+            console.print(
+                "[yellow]Background daemon is currently stopped. Start it with 'agentsync daemon start' "
+                "or run 'agentsync repair' once locking apps are closed.[/yellow]"
+            )
+        return
     cmd_doctor(fix=True, dry_run=dry_run, force=force, config_file=config_file, data_dir=data_dir)
 
 
@@ -799,10 +900,10 @@ def cmd_sync(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show diff plan without modifying any files."),
     force: bool = typer.Option(False, "--force", help="Ignore running application lock guard."),
     include_subagents: bool = typer.Option(False, "--include-subagents", help="Include subagent chats."),
-    backup: bool = typer.Option(
-        True,
+    backup: bool | None = typer.Option(
+        None,
         "--backup/--no-backup",
-        help="Automatically create a SHA-256 + SQLite verified backup before mutating (enabled by default).",
+        help="Automatically create a SHA-256 + SQLite verified backup before mutating (defaults to config auto_backup).",
     ),
     targets: str | None = typer.Option(None, "--targets", help="Comma-separated target tools."),
     include: list[str] = typer.Option([], "--include", help="Include selectors, e.g. skills:*,mcp."),
@@ -832,9 +933,10 @@ def cmd_sync(
         targets=target_list,
     )
     engine = SyncEngine(cfg, adapters, options=options)
+    effective_backup = cfg.auto_backup if backup is None else backup
 
     try:
-        plan = engine.run(dry_run=dry_run, force=force, create_backup=backup)
+        plan = engine.run(dry_run=dry_run, force=force, create_backup=effective_backup)
     except AppsRunningError as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -844,21 +946,26 @@ def cmd_sync(
 
 @app.command("watch")
 def cmd_watch(
-    debounce: float = typer.Option(2.0, "--debounce", help="Debounce quiet interval in seconds."),
+    debounce: float | None = typer.Option(
+        None,
+        "--debounce",
+        help="Debounce quiet interval in seconds (defaults to active power profile).",
+    ),
     force: bool = typer.Option(False, "--force", help="Allow writes while target apps are running."),
     daemon: bool = typer.Option(False, "--daemon", help="Run silently with rotating daemon.log and Sync-on-Close."),
     include_subagents: bool = typer.Option(False, "--include-subagents", help="Include subagent chats."),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Run continuous debounced file-watching synchronization with automatic Sync-on-Close."""
+    """Run continuous Split-Tier real-time file watching with automatic Sync-on-Close."""
     _, cfg = _load_effective_config(config_file, data_dir)
     adapters = _build_adapters(cfg)
+    eff_debounce = debounce if debounce is not None else cfg.effective_debounce_seconds()
     options = SyncOptions(
         dry_run=False,
         force=force,
         include_subagents=include_subagents,
-        debounce_seconds=debounce,
+        debounce_seconds=eff_debounce,
     )
 
     def _on_done(plan: SyncPlan) -> None:
@@ -884,8 +991,9 @@ def cmd_watch(
 
     if not daemon:
         console.print(
-            f"[cyan]Starting watch mode across {', '.join(a.tool_name for a in adapters)} "
-            f"(debounce={debounce}s, Sync-on-Close enabled). Press Ctrl+C to stop.[/cyan]"
+            f"[cyan]Starting Split-Tier watch across {', '.join(a.tool_name for a in adapters)} "
+            f"(profile={cfg.power_profile}, debounce={eff_debounce}s, Sync-on-Close={'on' if cfg.sync_on_close_enabled else 'off'}). "
+            "Press Ctrl+C to stop.[/cyan]"
         )
     watcher = SyncWatcher(
         cfg,
@@ -900,7 +1008,162 @@ def cmd_watch(
     watcher.run_forever()
 
 
-# --- Autostart, Self-Updater, Portable Bundles, Support Bundle & Backup Verification ---
+# --- Native Daemon Control, Live Config, Autostart & Self-Updater ---
+
+
+@daemon_app.command("status")
+def cmd_daemon_status(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Display live telemetry for the single-instance background daemon."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    st = read_daemon_status(cfg)
+    queue = load_repair_queue(cfg.repair_queue_path)
+    badge = "[green]" + st.status.upper() + "[/green]" if st.status != "stopped" else "[yellow]STOPPED[/yellow]"
+    console.print(
+        Panel(
+            f"State          : {badge}\n"
+            f"PID / Version  : {st.pid or '-'} (v{st.version})\n"
+            f"Runtime Engine : {st.runtime_engine}\n"
+            f"Power Profile  : {st.power_profile}\n"
+            f"CPU / RAM      : {st.cpu_percent:.1f}% / {st.rss_mb:.1f} MB\n"
+            f"Syncs / Pending: {st.sync_count} completed | {st.pending_sync_count} pending\n"
+            f"Repair Queue   : {len(queue.entries)} queued\n"
+            f"Locked Apps    : {', '.join(st.locked_apps) or 'none'}\n"
+            f"Last Sync      : {st.last_sync_utc or '-'}\n"
+            f"Log File       : {cfg.daemon_log_path}\n"
+            f"Last Error     : {st.last_error or 'none'}",
+            title="AgentSync Background Daemon",
+        )
+    )
+
+
+@daemon_app.command("start")
+def cmd_daemon_start(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Start the windowless single-instance background daemon (agentsyncw)."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    st = start_daemon_background(cfg, config_path=mgr.config_path, data_dir=data_dir)
+    if st.status != "stopped" and st.pid > 0:
+        console.print(f"[green]Daemon running:[/green] PID {st.pid} (profile={st.power_profile}, engine={st.runtime_engine})")
+    else:
+        console.print(f"[yellow]Daemon spawn initiated; check log at {cfg.daemon_log_path}.[/yellow]")
+
+
+@daemon_app.command("stop")
+def cmd_daemon_stop(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Stop the running background daemon gracefully."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    stopped = stop_daemon(cfg)
+    if stopped:
+        console.print("[green]Background daemon stopped cleanly.[/green]")
+    else:
+        console.print("[yellow]Background daemon was not running.[/yellow]")
+
+
+@daemon_app.command("restart")
+def cmd_daemon_restart(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Restart the single-instance background daemon."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    st = restart_daemon(cfg, config_path=mgr.config_path, data_dir=data_dir)
+    console.print(f"[green]Daemon restarted:[/green] status={st.status}, PID={st.pid or '-'}")
+
+
+@daemon_app.command("pause")
+def cmd_daemon_pause(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Pause background real-time syncing without terminating the daemon."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    if send_daemon_command(cfg, "pause"):
+        console.print("[yellow]Sent PAUSE signal to background daemon.[/yellow]")
+    else:
+        console.print("[yellow]Background daemon is not running.[/yellow]")
+
+
+@daemon_app.command("resume")
+def cmd_daemon_resume(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Resume a paused background daemon."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    if send_daemon_command(cfg, "resume"):
+        console.print("[green]Sent RESUME signal to background daemon.[/green]")
+    else:
+        console.print("[yellow]Background daemon is not running.[/yellow]")
+
+
+@daemon_app.command("run")
+def cmd_daemon_run(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Run the single-instance daemon loop in the current process (used by systemd/launchd/fallback)."""
+    code = run_daemon_loop(config_path=config_file, data_dir=data_dir)
+    if code != 0:
+        raise typer.Exit(code=code)
+
+
+@config_app.command("list")
+def cmd_config_list(
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """List all editable AgentSync settings and their current values."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    tbl = Table(title=f"AgentSync Settings ({mgr.config_path})", expand=True)
+    tbl.add_column("Key", style="bold cyan", no_wrap=True)
+    tbl.add_column("Value", overflow="fold")
+    tbl.add_column("Type", style="dim", no_wrap=True)
+    for key in EDITABLE_CONFIG_KEYS:
+        val = getattr(cfg, key)
+        tbl.add_row(key, str(val), type(val).__name__)
+    console.print(tbl)
+
+
+@config_app.command("get")
+def cmd_config_get(
+    key: str = typer.Argument(..., help="Configuration key name."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Read a single AgentSync configuration setting."""
+    _, cfg = _load_effective_config(config_file, data_dir)
+    if key not in EDITABLE_CONFIG_KEYS:
+        console.print(f"[red]Unknown setting '{key}'. Valid keys: {', '.join(EDITABLE_CONFIG_KEYS)}[/red]")
+        raise typer.Exit(code=2)
+    typer.echo(str(getattr(cfg, key)))
+
+
+@config_app.command("set")
+def cmd_config_set(
+    key: str = typer.Argument(..., help="Configuration key name."),
+    value: str = typer.Argument(..., help="New setting value."),
+    config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
+    data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
+) -> None:
+    """Update a setting in config.toml and live hot-reload the running daemon."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    try:
+        updated = set_config_setting(cfg, key, value)
+    except Exception as exc:
+        console.print(f"[bold red]Invalid setting update:[/bold red] {exc}")
+        raise typer.Exit(code=2) from exc
+    mgr.save(updated)
+    reloaded = send_daemon_command(updated, "reload")
+    reload_note = " (live daemon hot-reloaded)" if reloaded else ""
+    console.print(f"[green]Updated {key} = {getattr(updated, key)}[/green]{reload_note}")
 
 
 @autostart_app.command("status")
@@ -908,21 +1171,24 @@ def cmd_autostart_status(
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Inspect whether unattended background Sync-on-Close autostart is enabled."""
+    """Inspect whether native windowless background autostart is enabled and healthy."""
     mgr, cfg = _load_effective_config(config_file, data_dir)
     st = autostart_status(cfg, config_path=mgr.config_path, data_dir=data_dir)
     badge = "[green]ENABLED[/green]" if st.enabled else "[yellow]DISABLED[/yellow]"
-    console.print(
-        Panel(
-            f"State     : {badge}\n"
-            f"Platform  : {st.platform} ({st.mechanism})\n"
-            f"Artifact  : {st.artifact_path}\n"
-            f"Command   : {st.executable}\n"
-            f"Daemon log: {cfg.daemon_log_path}\n"
-            f"Details   : {st.detail}",
-            title="AgentSync Autostart Status",
-        )
-    )
+    health = "[green]HEALTHY[/green]" if st.healthy else "[bold red]UNHEALTHY[/bold red]"
+    lines = [
+        f"State     : {badge} | Health: {health}",
+        f"Platform  : {st.platform} ({st.mechanism})",
+        f"Artifact  : {st.artifact_path}",
+        f"Executable: {st.executable or '-'}",
+        f"Arguments : {st.arguments or '-'}",
+        f"Daemon log: {cfg.daemon_log_path}",
+        f"Details   : {st.detail}",
+    ]
+    if st.issues:
+        lines.append("Issues    :")
+        lines.extend(f"  - [bold red]{iss}[/bold red]" for iss in st.issues)
+    console.print(Panel("\n".join(lines), title="AgentSync Native Autostart Status"))
 
 
 @autostart_app.command("enable")
@@ -930,7 +1196,7 @@ def cmd_autostart_enable(
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Enable unattended background synchronization on login (no Administrator privileges required)."""
+    """Enable native windowless background synchronization on login (ZERO VBS/WSH, no Admin required)."""
     mgr, cfg = _load_effective_config(config_file, data_dir)
     try:
         st = enable_autostart(cfg, config_path=mgr.config_path, data_dir=data_dir)
@@ -939,8 +1205,8 @@ def cmd_autostart_enable(
         raise typer.Exit(code=1) from exc
     cfg.autostart_enabled = True
     mgr.save(cfg)
-    console.print(f"[green]Autostart enabled ({st.mechanism}):[/green] {st.detail}")
-    console.print(f"[dim]Artifact: {st.artifact_path} | Log: {cfg.daemon_log_path}[/dim]")
+    console.print(f"[green]Native autostart enabled ({st.mechanism}):[/green] {st.detail}")
+    console.print(f"[dim]Executable: {st.executable} {st.arguments} | Log: {cfg.daemon_log_path}[/dim]")
 
 
 @autostart_app.command("disable")
@@ -948,7 +1214,7 @@ def cmd_autostart_disable(
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Disable and remove unattended background autostart."""
+    """Disable and remove unattended background autostart plus any legacy launcher artifacts."""
     mgr, cfg = _load_effective_config(config_file, data_dir)
     st = disable_autostart(cfg)
     cfg.autostart_enabled = False
@@ -959,14 +1225,25 @@ def cmd_autostart_disable(
 @app.command("update")
 def cmd_update(
     check: bool = typer.Option(False, "--check", help="Check for newer releases without installing."),
-    force: bool = typer.Option(False, "--force", help="Bypass 12-hour update cache and force upgrade."),
+    force: bool = typer.Option(False, "--force", help="Bypass 6-hour update cache and force upgrade."),
     pre: bool = typer.Option(False, "--pre", help="Include pre-release versions."),
+    detached: bool = typer.Option(
+        False,
+        "--detached",
+        help="On Windows, hand off the upgrade to a detached PowerShell helper after exit to prevent WinError 32.",
+    ),
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Check for newer AgentSync releases on GitHub and self-update in place."""
-    _, cfg = _load_effective_config(config_file, data_dir)
-    info = check_for_updates(cfg.update_cache_path, force=(force or check), include_pre=pre)
+    """Check for newer AgentSync releases on GitHub and self-update safely without WinError 32."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    want_pre = pre or cfg.update_channel == "prerelease"
+    info = check_for_updates(
+        cfg.update_cache_path,
+        force=(force or check),
+        include_pre=want_pre,
+        config=cfg,
+    )
     if info.error:
         console.print(f"[yellow]Update check failed (offline or rate-limited):[/yellow] {info.error}")
         console.print(f"[dim]Current version: v{info.current_version} (install method: {info.install_method})[/dim]")
@@ -988,9 +1265,25 @@ def cmd_update(
     if check:
         return
 
-    console.print(f"[cyan]Running in-place upgrade via {info.install_method}...[/cyan]")
-    res = perform_update(method=info.install_method, include_pre=pre)
+    invoked_as_exe = sys.platform == "win32" and Path(sys.argv[0]).name.lower() in (
+        "agentsync.exe",
+        "agentsyncw.exe",
+    )
+    use_detached = detached or invoked_as_exe
+
+    mode_note = "detached Windows helper" if use_detached else info.install_method
+    console.print(f"[cyan]Running upgrade via {mode_note}...[/cyan]")
+    res = perform_update(
+        config=cfg,
+        method=info.install_method,
+        include_pre=want_pre,
+        detached_on_windows=use_detached,
+        config_path=mgr.config_path,
+    )
     if res.success:
+        if res.detached_handoff:
+            console.print(f"[green]{res.restart_notice}[/green]")
+            raise typer.Exit(code=0)
         console.print(
             f"[green]Upgrade completed:[/green] v{res.previous_version} -> v{res.new_version or info.latest_version}"
         )
@@ -1127,8 +1420,44 @@ def cmd_status(
     config_file: Path | None = typer.Option(None, "--config", help="Override config.toml path."),
     data_dir: Path | None = typer.Option(None, "--data-dir", help="Override agentsync data directory."),
 ) -> None:
-    """Show synced entity counts, available backups, Apply Ledgers, recent runs, and conflicts."""
-    _, cfg = _load_effective_config(config_file, data_dir)
+    """Show runtime engine, daemon telemetry, autostart health, synced entities, backups, and ledgers."""
+    mgr, cfg = _load_effective_config(config_file, data_dir)
+    d_st = read_daemon_status(cfg)
+    a_st = autostart_status(cfg, config_path=mgr.config_path, data_dir=data_dir)
+    split = detect_split_installations(cfg)
+    r_queue = load_repair_queue(cfg.repair_queue_path)
+
+    daemon_line = (
+        f"[green]{d_st.status.upper()}[/green] (PID {d_st.pid}, {d_st.rss_mb:.1f} MB RAM, {d_st.cpu_percent:.1f}% CPU, "
+        f"syncs={d_st.sync_count}, pending={d_st.pending_sync_count})"
+        if d_st.status != "stopped"
+        else "[yellow]STOPPED[/yellow]"
+    )
+    auto_line = (
+        "[green]ENABLED (healthy)[/green]"
+        if (a_st.enabled and a_st.healthy)
+        else ("[bold red]ENABLED (UNHEALTHY)[/bold red]" if a_st.enabled else "[yellow]DISABLED[/yellow]")
+    )
+    split_line = (
+        f"[yellow]DRIFT DETECTED: {split.summary}[/yellow]"
+        if split.has_version_drift
+        else "[green]OK (no version drift)[/green]"
+    )
+    console.print(
+        Panel(
+            f"Version        : v{__version__}\n"
+            f"Runtime Engine : {runtime_engine_label(cfg.runtime_engine)}\n"
+            f"Power Profile  : {cfg.power_profile} (debounce={cfg.effective_debounce_seconds()}s, "
+            f"realtime={'on' if cfg.realtime_sync_enabled else 'off'}, "
+            f"sync-on-close={'on' if cfg.sync_on_close_enabled else 'off'})\n"
+            f"Daemon         : {daemon_line}\n"
+            f"Autostart      : {auto_line}\n"
+            f"Repair Queue   : {len(r_queue.entries)} pending\n"
+            f"Install Check  : {split_line}",
+            title="AgentSync Runtime & Background Engine",
+        )
+    )
+
     state = StateStore(cfg.state_db_path, readonly=True)
     try:
         counts = state.get_summary_counts()

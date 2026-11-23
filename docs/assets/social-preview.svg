@@ -37,7 +37,7 @@
   <circle cx="114" cy="436" r="6" fill="#f85149"/>
   <circle cx="134" cy="436" r="6" fill="#d29922"/>
   <circle cx="154" cy="436" r="6" fill="#3fb950"/>
-  <text x="184" y="441" font-family="ui-monospace, Consolas, monospace" font-size="14" fill="#8b949e">agentsync v0.4.0 - github.com/saleqss/agentsync</text>
+  <text x="184" y="441" font-family="ui-monospace, Consolas, monospace" font-size="14" fill="#8b949e">agentsync v0.5.0 - github.com/saleqss/agentsync</text>
   <text x="114" y="484" font-family="ui-monospace, Consolas, monospace" font-size="20" fill="#79c0ff">$ uv tool install git+https://github.com/saleqss/agentsync.git</text>
   <text x="114" y="522" font-family="ui-monospace, Consolas, monospace" font-size="20" fill="#3fb950">$ agentsync   # Launch 8-screen TUI (EN / RU / ZH)  |  agentsync autostart enable</text>
 </svg>

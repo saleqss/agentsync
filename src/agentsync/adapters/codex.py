@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from agentsync.accel import scan_rollout_jsonl_fast
 from agentsync.adapters.base import ToolAdapter, ToolCapabilities
 from agentsync.adapters.registry import register_adapter
 from agentsync.config import ToolConfig
@@ -315,21 +316,22 @@ def validate_codex_rollout_file(path: Path) -> list[str]:
     if not path.exists():
         return [f"Missing rollout file: {path}"]
     raw = path.read_bytes()
-    if raw.startswith(b"\xef\xbb\xbf"):
-        errors.append("File starts with UTF-8 BOM (must be UTF-8 without BOM)")
     if not raw.strip():
         return ["Rollout file is empty"]
-    lines = raw.decode("utf-8", errors="replace").split("\n")
-    non_empty = [line for line in lines if line.strip()]
-    if not non_empty:
-        return ["Rollout file contains no JSONL lines"]
 
-    # Validate Line 1 strictly as SessionMetaLine
-    try:
-        line1 = json.loads(non_empty[0])
-    except json.JSONDecodeError as exc:
-        return [f"Line 1 is not valid JSON: {exc}"]
+    scan = scan_rollout_jsonl_fast(raw)
+    if scan["has_bom"]:
+        errors.append("File starts with UTF-8 BOM (must be UTF-8 without BOM)")
+    if scan["line_count"] == 0:
+        return errors + ["Rollout file contains no JSONL lines"]
 
+    if scan["parse_error"] is not None:
+        err_line, err_msg = scan["parse_error"]
+        if err_line == 1:
+            return errors + [f"Line 1 is not valid JSON: {err_msg}"]
+        errors.append(f"Line {err_line} invalid: {err_msg}")
+
+    line1 = scan["line1"]
     if not isinstance(line1, dict):
         errors.append("Line 1 must be a JSON object")
     else:
@@ -347,46 +349,15 @@ def validate_codex_rollout_file(path: Path) -> list[str]:
             if payload.get("originator") == "agy-codex-sync" or payload.get("cli_version") == "agy-codex-sync":
                 errors.append("Legacy broken originator/cli_version 'agy-codex-sync' (causes infinite spinner)")
 
-    # Validate every subsequent line and verify hydration lifecycle events for message-bearing rollouts
-    has_response_msg = False
-    has_task_started = False
-    has_turn_context = False
-    has_item_completed = False
-    has_task_complete = False
-
-    for idx, line in enumerate(non_empty[1:], start=2):
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError as exc:
-            errors.append(f"Line {idx} invalid JSON: {exc}")
-            break
-        if not isinstance(obj, dict) or not obj.get("type") or not obj.get("timestamp"):
-            errors.append(f"Line {idx} missing required envelope keys ('timestamp', 'type')")
-            break
-        etype = obj.get("type")
-        pl = obj.get("payload")
-        if etype == "response_item" and isinstance(pl, dict) and pl.get("type") == "message":
-            has_response_msg = True
-        elif etype == "turn_context":
-            has_turn_context = True
-        elif etype == "event_msg" and isinstance(pl, dict):
-            pt = pl.get("type")
-            if pt == "task_started":
-                has_task_started = True
-            elif pt == "item_completed":
-                has_item_completed = True
-            elif pt == "task_complete":
-                has_task_complete = True
-
-    if has_response_msg:
+    if scan["has_response_msg"]:
         missing_events = []
-        if not has_task_started:
+        if not scan["has_task_started"]:
             missing_events.append("task_started")
-        if not has_turn_context:
+        if not scan["has_turn_context"]:
             missing_events.append("turn_context")
-        if not has_item_completed:
+        if not scan["has_item_completed"]:
             missing_events.append("item_completed")
-        if not has_task_complete:
+        if not scan["has_task_complete"]:
             missing_events.append("task_complete")
         if missing_events:
             errors.append(

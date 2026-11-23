@@ -20,7 +20,7 @@
 
   <!-- Left Title Block -->
   <rect x="64" y="54" width="106" height="28" rx="14" fill="#1f6feb" opacity="0.22" stroke="#58a6ff" stroke-width="1"/>
-  <text x="117" y="73" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="700" fill="#79c0ff">v0.4.0</text>
+  <text x="117" y="73" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="700" fill="#79c0ff">v0.5.0</text>
 
   <text x="64" y="142" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif" font-size="56" font-weight="800" letter-spacing="2" fill="#f0f6fc">AGENT<tspan fill="#58a6ff">SYNC</tspan></text>
   <rect x="64" y="156" width="360" height="4" rx="2" fill="url(#accent)"/>

@@ -1,4 +1,4 @@
-"""Full-featured responsive 8-screen interactive Textual TUI for AgentSync (EN/RU/ZH)."""
+"""Full-featured responsive 8-screen interactive Textual TUI for AgentSync v0.5.0 (EN/RU/ZH)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import webbrowser
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,13 +33,21 @@ from textual.widgets import (
 )
 
 from agentsync import __version__
+from agentsync.accel import runtime_engine_label
 from agentsync.adapters.registry import get_registry
 from agentsync.config import AgentSyncConfig, ConfigManager, PatchMode, SyncOptions, ToolConfig
+from agentsync.daemon import (
+    read_daemon_status,
+    restart_daemon,
+    send_daemon_command,
+    start_daemon_background,
+    stop_daemon,
+)
 from agentsync.discovery import DiscoveryEnv, discover_tools, merge_discovery_into_config
 from agentsync.engine.autostart import autostart_status, disable_autostart, enable_autostart
 from agentsync.engine.board import generate_inventory_board
 from agentsync.engine.bundle import export_profile_bundle
-from agentsync.engine.doctor import DoctorEngine
+from agentsync.engine.diagnostics import DiagnosticsEngine, DiagnosticsReport
 from agentsync.engine.handoff import HandoffEngine, LaunchMode
 from agentsync.engine.patch import DetectedAppStatus, PatchEngine, PatchRunResult
 from agentsync.engine.skill_export import install_agentsync_skill
@@ -139,6 +147,7 @@ class AgentSyncApp(App[None]):
         }
         self.active_bus = ProgressBus(self._on_progress_event_bg)
         self.last_patch_result: PatchRunResult | None = None
+        self.last_diag_report: DiagnosticsReport | None = None
         self._diff_actions: list[SyncAction] = []
         self.handoff_sessions: list[tuple[str, str, str, str, int]] = []
         self.palette_index: list[tuple[str, str, str, str]] = []
@@ -147,13 +156,14 @@ class AgentSyncApp(App[None]):
         self._watch_timer: Timer | None = None
         self._watching = False
         self._breakpoint = "wide"
-        self._suppress_switch_events = False
+        self._suppress_setting_events = False
 
     def compose(self) -> ComposeResult:
-        # Persistent Responsive Header
+        # Persistent Responsive Header with Live Health Pill & Update Pill
         with Horizontal(id="top-header"):
             yield Label(f"{t('app.title')} v{__version__}", id="brand-title")
             yield Label(t("status.idle"), id="status-badge")
+            yield Button(t("status.health_ok"), id="btn-health-badge")
             yield Button("", id="btn-update-badge")
             yield Label(self.env_profile.badge(), id="env-badge")
             yield Static("", classes="header-spacer")
@@ -290,7 +300,7 @@ class AgentSyncApp(App[None]):
                     yield DataTable(id="handoff-table", cursor_type="row")
                     yield Static("", id="handoff-output", classes="card", markup=False)
 
-                # 4. Live Watch & Sync-on-Close Monitor
+                # 4. Live Watch & Split-Tier Real-Time Sync
                 with VerticalScroll(id="screen-watch", classes="pane-scroll"):
                     yield Label(t("watch.title"), id="lbl-watch-title", classes="section-title")
                     yield Static(t("watch.subtitle"), id="lbl-watch-sub", markup=False)
@@ -313,13 +323,14 @@ class AgentSyncApp(App[None]):
                     yield DataTable(id="tools-table", cursor_type="row")
                     yield Input(placeholder=t("tools.custom_path_placeholder"), id="inp-custom-path")
 
-                # 6. Health, Audit & Deep Repair
+                # 6. Auto-Diagnostics & Deferred Self-Healing
                 with VerticalScroll(id="screen-health", classes="pane-scroll"):
                     yield Label(t("health.title"), id="lbl-health-title", classes="section-title")
-                    with Container(classes="action-grid-3"):
+                    with Container(classes="action-grid"):
                         yield Button(t("health.btn_run"), id="btn-health-run", variant="primary")
-                        yield Button(t("health.btn_repair_dry"), id="btn-health-repair-dry", variant="warning")
+                        yield Button(t("health.btn_repair_dry"), id="btn-health-repair-dry", variant="default")
                         yield Button(t("health.btn_repair"), id="btn-health-repair", variant="success")
+                        yield Button(t("health.btn_repair_on_close"), id="btn-health-repair-on-close", variant="warning")
                     yield Static("", id="health-summary", classes="card", markup=False)
                     yield DataTable(id="health-table", cursor_type="row")
 
@@ -336,43 +347,102 @@ class AgentSyncApp(App[None]):
                     yield Label(t("backups.ledger_heading"), id="lbl-ledger-heading", classes="section-title")
                     yield DataTable(id="ledger-table", cursor_type="row")
 
-                # 8. Settings, Autostart, Updates & Bundles
+                # 8. Complete Settings Center (Live Hot-Reload into Background Daemon)
                 with VerticalScroll(id="screen-settings", classes="pane-scroll"):
                     yield Label(t("settings.title"), id="lbl-settings-title", classes="section-title")
+
+                    # Card 1: Background Daemon & Autostart (Top Section)
                     with Vertical(classes="card"):
-                        yield Label(t("settings.language"), id="lbl-set-lang")
-                        with Container(classes="action-grid-3"):
-                            yield Button("English", id="btn-set-lang-en", variant="default")
-                            yield Button("Русский", id="btn-set-lang-ru", variant="default")
-                            yield Button("简体中文", id="btn-set-lang-zh", variant="default")
-                        yield Label(t("settings.patch_mode"), id="lbl-set-mode")
-                        with Container(classes="action-grid-3"):
-                            yield Button(t("mode.auto"), id="btn-set-mode-auto", variant="default")
-                            yield Button(t("mode.manual"), id="btn-set-mode-manual", variant="default")
-                        yield Label(t("settings.link_mode"), id="lbl-set-link")
-                        yield Select(
-                            [
-                                ("Auto (Symlink -> Junction -> Copy)", "auto"),
-                                ("Symlink", "symlink"),
-                                ("Atomic Copy", "copy"),
-                            ],
-                            value=self.config.skill_link_mode,
-                            id="sel-link-mode",
-                        )
-                        with Horizontal(classes="switch-row"):
-                            yield Label(t("settings.auto_scan"), id="lbl-set-autoscan")
-                            yield Switch(value=self.config.auto_scan_on_startup, id="sw-autoscan")
-                        with Horizontal(classes="switch-row"):
-                            yield Label(t("settings.strict_vocab"), id="lbl-set-vocab")
-                            yield Switch(value=self.config.strict_vocab_guard, id="sw-strict-vocab")
+                        yield Label(t("settings.daemon_heading"), id="lbl-daemon-heading", classes="section-title")
+                        yield Static("", id="daemon-telemetry", markup=False)
+                        with Container(classes="action-grid"):
+                            yield Button(t("settings.btn_daemon_start"), id="btn-daemon-start", variant="success")
+                            yield Button(t("settings.btn_daemon_stop"), id="btn-daemon-stop", variant="error")
+                            yield Button(t("settings.btn_daemon_restart"), id="btn-daemon-restart", variant="warning")
+                            yield Button(t("settings.btn_daemon_log"), id="btn-daemon-log", variant="default")
                         with Horizontal(classes="switch-row"):
                             yield Label(t("settings.autostart"), id="lbl-set-autostart")
                             yield Switch(value=self.config.autostart_enabled, id="sw-autostart")
                         with Horizontal(classes="switch-row"):
-                            yield Label(t("settings.notifications"), id="lbl-set-notify")
-                            yield Switch(value=self.config.notifications, id="sw-notifications")
+                            yield Label(t("settings.realtime_sync"), id="lbl-set-realtime")
+                            yield Switch(value=self.config.realtime_sync_enabled, id="sw-realtime")
+                        with Horizontal(classes="switch-row"):
+                            yield Label(t("settings.sync_on_close"), id="lbl-set-synconclose")
+                            yield Switch(value=self.config.sync_on_close_enabled, id="sw-synconclose")
+                        with Horizontal(classes="switch-row"):
+                            yield Label(t("settings.auto_diag"), id="lbl-set-autodiag")
+                            yield Switch(value=self.config.auto_diagnostics_enabled, id="sw-autodiag")
+                        with Horizontal(classes="switch-row"):
+                            yield Label(t("settings.auto_heal"), id="lbl-set-autoheal")
+                            yield Switch(value=self.config.auto_heal_on_close, id="sw-autoheal")
+                        with Container(classes="opt-grid"):
+                            yield Select(
+                                [
+                                    ("Eco (Low Load, 2.5s)", "eco"),
+                                    ("Instant (Fast, 0.8s)", "instant"),
+                                    ("Battery-Safe (Pause on Battery)", "battery_safe"),
+                                ],
+                                value=self.config.power_profile,
+                                id="sel-power-profile",
+                            )
+                            yield Select(
+                                [
+                                    ("Debounce: 0.5s", "0.5"),
+                                    ("Debounce: 0.8s", "0.8"),
+                                    ("Debounce: 1.5s", "1.5"),
+                                    ("Debounce: 2.5s", "2.5"),
+                                    ("Debounce: 5.0s", "5.0"),
+                                    ("Debounce: 10.0s", "10.0"),
+                                ],
+                                value=self._nearest_debounce_opt(self.config.debounce_seconds),
+                                id="sel-debounce",
+                            )
                         yield Static("", id="lbl-autostart-status", classes="muted-hint", markup=False)
 
+                    # Card 2: Sync, Safety & Runtime Engine
+                    with Vertical(classes="card"):
+                        yield Label(t("settings.sync_heading"), id="lbl-sync-heading", classes="section-title")
+                        yield Label(t("settings.patch_mode"), id="lbl-set-mode")
+                        with Container(classes="action-grid-3"):
+                            yield Button(t("mode.auto"), id="btn-set-mode-auto", variant="default")
+                            yield Button(t("mode.manual"), id="btn-set-mode-manual", variant="default")
+                        with Container(classes="opt-grid"):
+                            yield Select(
+                                [
+                                    ("Skill Link: Auto", "auto"),
+                                    ("Skill Link: Symlink", "symlink"),
+                                    ("Skill Link: Atomic Copy", "copy"),
+                                ],
+                                value=self.config.skill_link_mode,
+                                id="sel-link-mode",
+                            )
+                            yield Select(
+                                [
+                                    ("Engine: Auto (Rust if available)", "auto"),
+                                    ("Engine: Pure Python", "python"),
+                                ],
+                                value=self.config.runtime_engine,
+                                id="sel-runtime-engine",
+                            )
+                        yield Label(
+                            t("settings.runtime_engine", active=runtime_engine_label(self.config.runtime_engine)),
+                            id="lbl-runtime-engine",
+                            classes="muted-hint",
+                        )
+                        with Horizontal(classes="switch-row"):
+                            yield Label(t("settings.auto_backup"), id="lbl-set-autobackup")
+                            yield Switch(value=self.config.auto_backup, id="sw-autobackup")
+                        with Horizontal(classes="switch-row"):
+                            yield Label(t("settings.auto_scan"), id="lbl-set-autoscan")
+                            yield Switch(value=self.config.auto_scan_on_startup, id="sw-autoscan")
+                        with Horizontal(classes="switch-row"):
+                            yield Label(t("settings.strip_secrets"), id="lbl-set-strip")
+                            yield Switch(value=self.config.strip_secrets, id="sw-strip-secrets")
+                        with Horizontal(classes="switch-row"):
+                            yield Label(t("settings.strict_vocab"), id="lbl-set-vocab")
+                            yield Switch(value=self.config.strict_vocab_guard, id="sw-strict-vocab")
+
+                    # Card 3: In-App Updates, Notifications & UI
                     with Vertical(classes="card"):
                         yield Label(t("settings.updates_heading"), id="lbl-updates-heading", classes="section-title")
                         yield Static(
@@ -380,9 +450,35 @@ class AgentSyncApp(App[None]):
                             id="lbl-update-status",
                             markup=False,
                         )
+                        with Container(classes="opt-grid"):
+                            yield Select(
+                                [
+                                    ("Policy: Notify in App", "notify"),
+                                    ("Policy: Auto-Update", "auto"),
+                                    ("Policy: Manual Only", "manual"),
+                                ],
+                                value=self.config.update_policy,
+                                id="sel-update-policy",
+                            )
+                            yield Select(
+                                [
+                                    ("Channel: Stable", "stable"),
+                                    ("Channel: Pre-release", "prerelease"),
+                                ],
+                                value=self.config.update_channel,
+                                id="sel-update-channel",
+                            )
                         with Container(classes="action-grid-3"):
                             yield Button(t("settings.btn_check_update"), id="btn-check-update", variant="primary")
                             yield Button(t("settings.btn_apply_update"), id="btn-apply-update", variant="success")
+                        with Horizontal(classes="switch-row"):
+                            yield Label(t("settings.notifications"), id="lbl-set-notify")
+                            yield Switch(value=self.config.notifications, id="sw-notifications")
+                        yield Label(t("settings.language"), id="lbl-set-lang")
+                        with Container(classes="action-grid-3"):
+                            yield Button("English", id="btn-set-lang-en", variant="default")
+                            yield Button("Русский", id="btn-set-lang-ru", variant="default")
+                            yield Button("简体中文", id="btn-set-lang-zh", variant="default")
 
                     with Container(classes="action-grid"):
                         yield Button(t("settings.btn_board"), id="btn-open-board", variant="primary")
@@ -399,6 +495,12 @@ class AgentSyncApp(App[None]):
 
         yield Static(t("footer.keys"), id="bottom-footer", markup=False)
 
+    @staticmethod
+    def _nearest_debounce_opt(val: float) -> str:
+        opts = [0.5, 0.8, 1.5, 2.5, 5.0, 10.0]
+        best = min(opts, key=lambda x: abs(x - val))
+        return str(best)
+
     def on_mount(self) -> None:
         if self.ascii_mode:
             self.screen.add_class("legacy-console")
@@ -407,7 +509,8 @@ class AgentSyncApp(App[None]):
         self._refresh_locale_widgets()
         self._refresh_backups_view()
         self._refresh_autostart_status()
-        if self._check_updates_on_mount and self.config.auto_check_updates:
+        self._refresh_daemon_telemetry()
+        if self._check_updates_on_mount and self.config.auto_check_updates and self.config.update_policy != "manual":
             self._check_updates_worker(force=False)
         if self.config.auto_scan_on_startup:
             self.action_trigger_scan(open_wizard_after=self._should_open_onboarding())
@@ -479,6 +582,22 @@ class AgentSyncApp(App[None]):
         if style:
             badge.add_class(style)
 
+    def _update_health_pill(self, error_count: int, warning_count: int) -> None:
+        pill = self.query_one("#btn-health-badge", Button)
+        total = error_count + warning_count
+        pill.remove_class("warn", "err")
+        if total == 0:
+            pill.label = Content.from_text(t("status.health_ok"))
+        else:
+            pill.label = Content.from_text(t("status.health_issues", count=total))
+            pill.add_class("err" if error_count > 0 else "warn")
+
+    def _persist_and_hot_reload_daemon(self) -> None:
+        """Persist config.toml and signal the background daemon to hot-reload live."""
+        if self.cfg_mgr.exists() or self.config.onboarding_completed:
+            self.cfg_mgr.save(self.config)
+            send_daemon_command(self.config, "reload")
+
     def _on_progress_event_bg(self, ev: ProgressEvent) -> None:
         self.call_from_thread(self._apply_progress_event, ev)
 
@@ -493,8 +612,8 @@ class AgentSyncApp(App[None]):
     def _apply_locale(self, code: str, *, persist: bool = True) -> None:
         normalized = set_locale(code)
         self.config.locale = normalized  # type: ignore[assignment]
-        if persist and (self.cfg_mgr.exists() or self.config.onboarding_completed):
-            self.cfg_mgr.save(self.config)
+        if persist:
+            self._persist_and_hot_reload_daemon()
         self._refresh_locale_widgets()
 
     def _refresh_locale_widgets(self) -> None:
@@ -565,6 +684,7 @@ class AgentSyncApp(App[None]):
         self.query_one("#btn-health-run", Button).label = Content.from_text(t("health.btn_run"))
         self.query_one("#btn-health-repair-dry", Button).label = Content.from_text(t("health.btn_repair_dry"))
         self.query_one("#btn-health-repair", Button).label = Content.from_text(t("health.btn_repair"))
+        self.query_one("#btn-health-repair-on-close", Button).label = Content.from_text(t("health.btn_repair_on_close"))
 
         self.query_one("#lbl-backups-title", Label).update(Content.from_text(t("backups.title")))
         self.query_one("#btn-backups-create", Button).label = Content.from_text(t("backups.btn_create"))
@@ -573,16 +693,31 @@ class AgentSyncApp(App[None]):
         self.query_one("#btn-backups-restore", Button).label = Content.from_text(t("backups.btn_restore"))
         self.query_one("#lbl-ledger-heading", Label).update(Content.from_text(t("backups.ledger_heading")))
 
+        # Complete Settings Center labels
         self.query_one("#lbl-settings-title", Label).update(Content.from_text(t("settings.title")))
+        self.query_one("#lbl-daemon-heading", Label).update(Content.from_text(t("settings.daemon_heading")))
+        self.query_one("#btn-daemon-start", Button).label = Content.from_text(t("settings.btn_daemon_start"))
+        self.query_one("#btn-daemon-stop", Button).label = Content.from_text(t("settings.btn_daemon_stop"))
+        self.query_one("#btn-daemon-restart", Button).label = Content.from_text(t("settings.btn_daemon_restart"))
+        self.query_one("#btn-daemon-log", Button).label = Content.from_text(t("settings.btn_daemon_log"))
+        self.query_one("#lbl-sync-heading", Label).update(Content.from_text(t("settings.sync_heading")))
         self.query_one("#lbl-set-lang", Label).update(Content.from_text(t("settings.language")))
         self.query_one("#lbl-set-mode", Label).update(Content.from_text(t("settings.patch_mode")))
         self.query_one("#btn-set-mode-auto", Button).label = Content.from_text(t("mode.auto"))
         self.query_one("#btn-set-mode-manual", Button).label = Content.from_text(t("mode.manual"))
-        self.query_one("#lbl-set-link", Label).update(Content.from_text(t("settings.link_mode")))
         self.query_one("#lbl-set-autoscan", Label).update(Content.from_text(t("settings.auto_scan")))
+        self.query_one("#lbl-set-autobackup", Label).update(Content.from_text(t("settings.auto_backup")))
+        self.query_one("#lbl-set-strip", Label).update(Content.from_text(t("settings.strip_secrets")))
         self.query_one("#lbl-set-vocab", Label).update(Content.from_text(t("settings.strict_vocab")))
         self.query_one("#lbl-set-autostart", Label).update(Content.from_text(t("settings.autostart")))
+        self.query_one("#lbl-set-realtime", Label).update(Content.from_text(t("settings.realtime_sync")))
+        self.query_one("#lbl-set-synconclose", Label).update(Content.from_text(t("settings.sync_on_close")))
+        self.query_one("#lbl-set-autodiag", Label).update(Content.from_text(t("settings.auto_diag")))
+        self.query_one("#lbl-set-autoheal", Label).update(Content.from_text(t("settings.auto_heal")))
         self.query_one("#lbl-set-notify", Label).update(Content.from_text(t("settings.notifications")))
+        self.query_one("#lbl-runtime-engine", Label).update(
+            Content.from_text(t("settings.runtime_engine", active=runtime_engine_label(self.config.runtime_engine)))
+        )
         self.query_one("#lbl-updates-heading", Label).update(Content.from_text(t("settings.updates_heading")))
         self.query_one("#btn-check-update", Button).label = Content.from_text(t("settings.btn_check_update"))
         self.query_one("#btn-apply-update", Button).label = Content.from_text(t("settings.btn_apply_update"))
@@ -596,15 +731,16 @@ class AgentSyncApp(App[None]):
         self.query_one("#lbl-guide-title", Label).update(Content.from_text(t("guide.title")))
         self.query_one("#guide-body", Static).update(Content.from_text(t("guide.body")))
         self._update_dash_summary()
+        self._refresh_daemon_telemetry()
 
     def _set_patch_mode(self, mode: PatchMode, *, persist: bool = True) -> None:
         self.config.patch_mode = mode
-        if persist and (self.cfg_mgr.exists() or self.config.onboarding_completed):
-            self.cfg_mgr.save(self.config)
+        if persist:
+            self._persist_and_hot_reload_daemon()
         self.query_one("#sel-patch-workflow", Select).value = mode
         self._refresh_locale_widgets()
 
-    # --- Actions (also called from Global Command Palette) ---
+    # --- Actions ---
 
     def action_switch_screen(self, screen_id: str) -> None:
         self.query_one("#main-switcher", ContentSwitcher).current = screen_id
@@ -614,6 +750,9 @@ class AgentSyncApp(App[None]):
                 btn.add_class("active")
             else:
                 btn.remove_class("active")
+        if screen_id == "screen-settings":
+            self._refresh_daemon_telemetry()
+            self._refresh_autostart_status()
 
     def action_cycle_language(self) -> None:
         self._apply_locale(cycle_locale(), persist=True)
@@ -704,7 +843,6 @@ class AgentSyncApp(App[None]):
             self.config = merge_discovery_into_config(self.config, disc_map)
             self.checked_tools = set(installed_names)
         else:
-            # Strict 1:1 parity: ONLY installed tools with enabled config (never stale non-installed keys!)
             self.checked_tools = {
                 a.tool_name
                 for a in apps
@@ -749,7 +887,7 @@ class AgentSyncApp(App[None]):
 
     @work(thread=True, exclusive=True, group="updates")
     def _check_updates_worker(self, *, force: bool = False) -> None:
-        info = check_for_updates(self.config.update_cache_path, force=force)
+        info = check_for_updates(self.config.update_cache_path, force=force, config=self.config)
         self.call_from_thread(self._apply_update_info, info)
 
     def _apply_update_info(self, info: UpdateCheckResult) -> None:
@@ -759,7 +897,7 @@ class AgentSyncApp(App[None]):
         if info.error:
             badge.remove_class("visible")
             status_lbl.update(Content.from_text(t("settings.update_err", error=info.error[:80])))
-        elif info.update_available:
+        elif info.update_available and not info.suppressed_by_user:
             badge.label = Content.from_text(t("status.update_badge", version=info.latest_version))
             badge.add_class("visible")
             status_lbl.update(
@@ -787,8 +925,18 @@ class AgentSyncApp(App[None]):
     @work(thread=True, exclusive=True, group="update_apply")
     def _apply_update_worker(self) -> None:
         self.call_from_thread(self._set_status, "status.patching", "busy")
-        res = perform_update()
+        res = perform_update(
+            config=self.config,
+            include_pre=(self.config.update_channel == "prerelease"),
+            detached_on_windows=(sys.platform == "win32"),
+            relaunch_tui=True,
+            config_path=self.cfg_mgr.config_path,
+        )
         self.call_from_thread(self._set_status, "status.idle", "")
+        if res.detached_handoff:
+            self.call_from_thread(self.notify, res.restart_notice or "Updating...", severity="information")
+            self.call_from_thread(self.exit)
+            return
         if res.success:
             msg = f"Updated agentsync: v{res.previous_version} -> v{res.new_version or 'latest'}"
             if res.restart_notice:
@@ -864,6 +1012,9 @@ class AgentSyncApp(App[None]):
         for iss in issues:
             tbl.add_row(iss.severity.upper(), iss.tool, iss.code, "yes" if iss.fixable else "no", iss.message)
         fixable = sum(1 for i in issues if i.fixable)
+        err_cnt = sum(1 for i in issues if i.severity == "error")
+        warn_cnt = sum(1 for i in issues if i.severity == "warning")
+        self._update_health_pill(err_cnt, warn_cnt)
         summary = t("health.found", count=len(issues), fixable=fixable) if issues else t("health.clean")
         self.query_one("#health-summary", Static).update(Content.from_text(summary))
 
@@ -934,13 +1085,31 @@ class AgentSyncApp(App[None]):
                 entry.plan_hash[:12],
             )
 
+    def _refresh_daemon_telemetry(self) -> None:
+        st = read_daemon_status(self.config)
+        if st.status != "stopped" and st.pid > 0:
+            txt = t(
+                "settings.daemon_running",
+                pid=st.pid,
+                version=st.version,
+                rss=st.rss_mb,
+                cpu=st.cpu_percent,
+                psync=st.pending_sync_count,
+                prep=st.pending_repair_count,
+            )
+        else:
+            txt = t(
+                "settings.daemon_stopped",
+                profile=self.config.power_profile,
+                engine=runtime_engine_label(self.config.runtime_engine),
+            )
+        self.query_one("#daemon-telemetry", Static).update(Content.from_text(txt))
+
     def _refresh_autostart_status(self) -> None:
         st = autostart_status(self.config, config_path=self.cfg_mgr.config_path)
-        self._suppress_switch_events = True
-        try:
-            self.query_one("#sw-autostart", Switch).value = st.enabled
-        finally:
-            self._suppress_switch_events = False
+        sw = self.query_one("#sw-autostart", Switch)
+        with sw.prevent(Switch.Changed):
+            sw.value = st.enabled
         self.query_one("#lbl-autostart-status", Static).update(
             Content.from_text(
                 t(
@@ -963,7 +1132,7 @@ class AgentSyncApp(App[None]):
                 for name, tc in self.config.tools.items():
                     tc.enabled = name in selected
             self.config.onboarding_completed = True
-            self.cfg_mgr.save(self.config)
+            self._persist_and_hot_reload_daemon()
             self._sync_checklist_widgets()
             if result.get("action") == "dry_run":
                 self.action_switch_screen("screen-patch")
@@ -980,7 +1149,7 @@ class AgentSyncApp(App[None]):
             _done,
         )
 
-    # --- Patch / Sync / Repair / Backup / Handoff Workers ---
+    # --- Patch / Diagnostics / Backup / Handoff Workers ---
 
     def _selected_installed_tools(self) -> list[str]:
         installed = {a.tool_name for a in self.detected_apps if a.installed}
@@ -1092,7 +1261,7 @@ class AgentSyncApp(App[None]):
             self._update_dash_summary()
 
     @work(thread=True, exclusive=True, group="health")
-    def _run_health_worker(self, *, repair: bool, dry_run: bool) -> None:
+    def _run_health_worker(self, *, repair: bool, dry_run: bool, queue_on_close: bool = False) -> None:
         self.call_from_thread(self._set_status, "status.scanning", "busy")
         reg = get_registry()
         adapters = [
@@ -1100,12 +1269,17 @@ class AgentSyncApp(App[None]):
             for name in self._selected_installed_tools()
             if name in self.config.tools and name in reg.list_names()
         ]
-        doc = DoctorEngine(self.config, adapters)
-        issues = doc.diagnose()
+        diag = DiagnosticsEngine(self.config, adapters, config_path=self.cfg_mgr.config_path)
+        report = diag.run_all(verify_backups=False, check_split_install=False)
         rep_msg = ""
-        if repair and issues:
+
+        if queue_on_close:
+            q = diag.queue_repairs_on_close(report.issues, safe_only=False)
+            send_daemon_command(self.config, "repair_queued")
+            rep_msg = f" | {t('health.queued_on_close', count=len(q.entries))}"
+        elif repair and report.issues:
             try:
-                results, bid = doc.repair(
+                results, bid = diag.doctor.repair(
                     dry_run=dry_run,
                     force=not self.check_processes,
                     check_processes=self.check_processes,
@@ -1115,20 +1289,26 @@ class AgentSyncApp(App[None]):
                     f" (backup: {bid})" if bid else ""
                 )
                 if not dry_run:
-                    issues = doc.diagnose()
+                    report = diag.run_all(verify_backups=False, check_split_install=False)
             except Exception as exc:
                 self.call_from_thread(self.notify, t("progress.error", error=str(exc)), severity="error")
-        self.call_from_thread(self._on_health_done, issues, rep_msg)
+        self.call_from_thread(self._on_health_done, report, rep_msg)
 
-    def _on_health_done(self, issues: list[Any], rep_msg: str) -> None:
+    def _on_health_done(self, report: DiagnosticsReport, rep_msg: str) -> None:
+        self.last_diag_report = report
         self._set_status("status.idle", "")
         tbl = self.query_one("#health-table", DataTable)
         tbl.clear()
-        for iss in issues:
+        for iss in report.issues:
             tbl.add_row(iss.severity.upper(), iss.tool, iss.code, "yes" if iss.fixable else "no", iss.message)
-        fixable = sum(1 for i in issues if i.fixable)
-        base = t("health.found", count=len(issues), fixable=fixable) if issues else t("health.clean")
-        self.query_one("#health-summary", Static).update(Content.from_text(base + rep_msg))
+        self._update_health_pill(report.error_count, report.warning_count)
+        base = (
+            t("health.found", count=len(report.issues), fixable=report.fixable_count)
+            if report.issues
+            else t("health.clean")
+        )
+        engine_tag = f" | Engine: {report.runtime_engine}"
+        self.query_one("#health-summary", Static).update(Content.from_text(base + engine_tag + rep_msg))
         self._refresh_backups_view()
 
     @work(thread=True, exclusive=True, group="backups")
@@ -1275,13 +1455,25 @@ class AgentSyncApp(App[None]):
             self._refresh_tools_table()
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
-        if self._suppress_switch_events:
+        if self._suppress_setting_events:
             return
         sid = event.switch.id or ""
         if sid == "sw-autoscan":
             self.config.auto_scan_on_startup = event.value
+        elif sid == "sw-autobackup":
+            self.config.auto_backup = event.value
+        elif sid == "sw-strip-secrets":
+            self.config.strip_secrets = event.value
         elif sid == "sw-strict-vocab":
             self.config.strict_vocab_guard = event.value
+        elif sid == "sw-realtime":
+            self.config.realtime_sync_enabled = event.value
+        elif sid == "sw-synconclose":
+            self.config.sync_on_close_enabled = event.value
+        elif sid == "sw-autodiag":
+            self.config.auto_diagnostics_enabled = event.value
+        elif sid == "sw-autoheal":
+            self.config.auto_heal_on_close = event.value
         elif sid == "sw-notifications":
             self.config.notifications = event.value
         elif sid == "sw-autostart":
@@ -1304,14 +1496,36 @@ class AgentSyncApp(App[None]):
                 self.notify(t("progress.error", error=str(exc)), severity="error")
                 self._refresh_autostart_status()
                 return
-        if self.cfg_mgr.exists() or self.config.onboarding_completed:
-            self.cfg_mgr.save(self.config)
+        self._persist_and_hot_reload_daemon()
+        self._refresh_daemon_telemetry()
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "sel-link-mode" and event.value in ("auto", "symlink", "copy"):
-            self.config.skill_link_mode = str(event.value)  # type: ignore[assignment]
-            if self.cfg_mgr.exists():
-                self.cfg_mgr.save(self.config)
+        if self._suppress_setting_events or event.value is Select.BLANK:
+            return
+        sid = event.select.id or ""
+        val = str(event.value)
+        if sid == "sel-link-mode" and val in ("auto", "symlink", "copy"):
+            self.config.skill_link_mode = val  # type: ignore[assignment]
+        elif sid == "sel-power-profile" and val in ("eco", "instant", "battery_safe"):
+            self.config.power_profile = val  # type: ignore[assignment]
+        elif sid == "sel-debounce":
+            try:
+                self.config.debounce_seconds = float(val)
+            except ValueError:
+                return
+        elif sid == "sel-runtime-engine" and val in ("auto", "python"):
+            self.config.runtime_engine = val  # type: ignore[assignment]
+            self.query_one("#lbl-runtime-engine", Label).update(
+                Content.from_text(t("settings.runtime_engine", active=runtime_engine_label(val)))
+            )
+        elif sid == "sel-update-policy" and val in ("notify", "auto", "manual"):
+            self.config.update_policy = val  # type: ignore[assignment]
+        elif sid == "sel-update-channel" and val in ("stable", "prerelease"):
+            self.config.update_channel = val  # type: ignore[assignment]
+        else:
+            return
+        self._persist_and_hot_reload_daemon()
+        self._refresh_daemon_telemetry()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
@@ -1320,6 +1534,10 @@ class AgentSyncApp(App[None]):
             if bid == nav_btn_id:
                 self.action_switch_screen(screen_id)
                 return
+
+        if bid == "btn-health-badge":
+            self.action_run_doctor()
+            return
 
         if bid in ("btn-lang-en", "btn-set-lang-en"):
             self._apply_locale("en", persist=True)
@@ -1399,18 +1617,20 @@ class AgentSyncApp(App[None]):
         elif bid == "btn-tools-save":
             for name, tc in self.config.tools.items():
                 tc.enabled = name in self.checked_tools
-            self.cfg_mgr.save(self.config)
+            self._persist_and_hot_reload_daemon()
             self.notify(t("tools.saved", path=str(self.cfg_mgr.config_path)))
         elif bid == "btn-set-custom-path":
             self._apply_custom_tool_path()
 
-        # Health
+        # Diagnostics & Auto-Heal
         elif bid == "btn-health-run":
             self._run_health_worker(repair=False, dry_run=True)
         elif bid == "btn-health-repair-dry":
             self._run_health_worker(repair=True, dry_run=True)
         elif bid == "btn-health-repair":
             self._run_health_worker(repair=True, dry_run=False)
+        elif bid == "btn-health-repair-on-close":
+            self._run_health_worker(repair=False, dry_run=True, queue_on_close=True)
 
         # Backups
         elif bid == "btn-backups-create":
@@ -1421,6 +1641,19 @@ class AgentSyncApp(App[None]):
             self._refresh_backups_view()
         elif bid == "btn-backups-restore":
             self._confirm_restore_backup()
+
+        # Daemon Lifecycle in Settings
+        elif bid == "btn-daemon-start":
+            start_daemon_background(self.config, config_path=self.cfg_mgr.config_path)
+            self._refresh_daemon_telemetry()
+        elif bid == "btn-daemon-stop":
+            stop_daemon(self.config)
+            self._refresh_daemon_telemetry()
+        elif bid == "btn-daemon-restart":
+            restart_daemon(self.config, config_path=self.cfg_mgr.config_path)
+            self._refresh_daemon_telemetry()
+        elif bid == "btn-daemon-log":
+            self._open_folder(self.config.daemon_log_path.parent)
 
         # Settings extras
         elif bid == "btn-check-update":
@@ -1446,14 +1679,22 @@ class AgentSyncApp(App[None]):
             self._open_folder(self.config.backups_dir)
 
     def _open_update_modal(self) -> None:
-        info = self.update_info or check_for_updates(self.config.update_cache_path, force=False)
+        info = self.update_info or check_for_updates(self.config.update_cache_path, force=False, config=self.config)
         self.update_info = info
 
-        def _on_confirm(ok: bool | None) -> None:
-            if ok:
+        def _on_choice(choice: str | None) -> None:
+            if choice == "update":
                 self._apply_update_worker()
+            elif choice == "remind":
+                self.config.remind_update_after_utc = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
+                self._persist_and_hot_reload_daemon()
+                self.query_one("#btn-update-badge", Button).remove_class("visible")
+            elif choice == "skip":
+                self.config.skipped_update_version = info.latest_version
+                self._persist_and_hot_reload_daemon()
+                self.query_one("#btn-update-badge", Button).remove_class("visible")
 
-        self.push_screen(UpdateModal(info), _on_confirm)
+        self.push_screen(UpdateModal(info), _on_choice)
 
     def _export_bundle_now(self) -> None:
         reg = get_registry()
@@ -1492,7 +1733,7 @@ class AgentSyncApp(App[None]):
             self.config.tools[tname] = ToolConfig(enabled=True, path=new_path)
         else:
             self.config.tools[tname].path = new_path
-        self.cfg_mgr.save(self.config)
+        self._persist_and_hot_reload_daemon()
         self.notify(f"{tname} -> {new_path}")
         self.action_trigger_scan(open_wizard_after=False)
 
@@ -1544,7 +1785,7 @@ class AgentSyncApp(App[None]):
             _on_ok,
         )
 
-    # --- Real Live SyncWatcher wired to Screen 4 ---
+    # --- Real Live Split-Tier SyncWatcher wired to Screen 4 ---
 
     def _on_watch_log_bg(self, level: str, message: str) -> None:
         try:
@@ -1570,16 +1811,20 @@ class AgentSyncApp(App[None]):
             self.query_one("#watch-roots-label", Static).update("")
             return
         snap = self._watcher.status_snapshot()
-        if snap.paused:
+        pending_total = len(snap.pending_queue) + len(snap.pending_tier1_queue)
+        if snap.paused or snap.battery_paused:
             self._set_status("status.paused", "warn")
             self.query_one("#watch-state-label", Static).update(
                 Content.from_text(
-                    t("watch.paused_state", pending=len(snap.pending_queue), syncs=snap.sync_count)
+                    t("watch.paused_state", pending=pending_total, syncs=snap.sync_count)
                 )
             )
         else:
             locked_str = ", ".join(snap.running_locked_apps) if snap.running_locked_apps else "none"
-            self._set_status("status.running_warn" if snap.running_locked_apps else "status.watching", "warn" if snap.running_locked_apps else "busy")
+            self._set_status(
+                "status.running_warn" if snap.running_locked_apps else "status.watching",
+                "warn" if snap.running_locked_apps else "busy",
+            )
             self.query_one("#watch-state-label", Static).update(
                 Content.from_text(
                     t(
@@ -1587,7 +1832,7 @@ class AgentSyncApp(App[None]):
                         count=len(self._watcher.adapters),
                         roots=len(snap.watched_roots),
                         locked=locked_str,
-                        pending=len(snap.pending_queue),
+                        pending=pending_total,
                         syncs=snap.sync_count,
                     )
                 )
@@ -1615,7 +1860,7 @@ class AgentSyncApp(App[None]):
             dry_run=False,
             force=not self.check_processes,
             include_subagents=self.config.include_subagents,
-            debounce_seconds=self.config.debounce_seconds,
+            debounce_seconds=self.config.effective_debounce_seconds(),
             targets=[a.tool_name for a in adapters],
         )
         self._watcher = SyncWatcher(
@@ -1627,6 +1872,7 @@ class AgentSyncApp(App[None]):
             daemon_mode=False,
             run_startup_sync=False,
             poll_interval_seconds=1.0,
+            config_path=self.cfg_mgr.config_path,
         )
         self._watcher.start()
         self._watching = True

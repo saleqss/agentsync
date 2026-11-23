@@ -11,7 +11,7 @@
   <circle cx="22" cy="17" r="5" fill="#f85149"/>
   <circle cx="40" cy="17" r="5" fill="#d29922"/>
   <circle cx="58" cy="17" r="5" fill="#3fb950"/>
-  <text x="450" y="22" text-anchor="middle" font-family="ui-monospace, Consolas, monospace" font-size="13" fill="#8b949e">agentsync v0.4.0 - Safe Sync-on-Close &amp; Deep Repair</text>
+  <text x="450" y="22" text-anchor="middle" font-family="ui-monospace, Consolas, monospace" font-size="13" fill="#8b949e">agentsync v0.5.0 - Safe Sync-on-Close &amp; Deep Repair</text>
 
   <text x="24" y="68" class="line l1" fill="#79c0ff">$ agentsync doctor</text>
   <text x="24" y="94" class="line l2" fill="#3fb950">[OK] codex.db / state_5.sqlite / thread_history_1.sqlite - PRAGMA integrity_check: ok</text>

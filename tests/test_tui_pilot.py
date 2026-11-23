@@ -6,10 +6,23 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Label, Static
+from textual.widgets import (
+    Button,
+    Checkbox,
+    ContentSwitcher,
+    DataTable,
+    Label,
+    Select,
+    Static,
+    Switch,
+)
 
+from agentsync import __version__
 from agentsync.config import AgentSyncConfig, ConfigManager
 from agentsync.discovery import DiscoveryEnv
+from agentsync.engine.autostart import AutostartStatus, SplitInstallReport
+from agentsync.engine.diagnostics import load_repair_queue
+from agentsync.engine.updater import UpdateCheckResult
 from agentsync.tui.app import SCREEN_IDS, AgentSyncApp
 
 
@@ -377,3 +390,108 @@ def test_tui_diff_modal_live_watch_and_backup_controls(sandbox: dict[str, Any]) 
             await pilot.pause(0.1)
 
     asyncio.run(_run())
+
+
+def test_tui_health_pill_repair_on_close_settings_and_update_modal(
+    sandbox: dict[str, Any], monkeypatch: Any
+) -> None:
+    """Header Health pill opens Screen 6 + queues repair-on-close; Screen 8 live settings persist; UpdateModal Remind/Skip work."""
+    cfg: AgentSyncConfig = sandbox["config"]
+    cfg.onboarding_completed = True
+    cfg_file: Path = sandbox["config_file"]
+    ConfigManager(cfg_file).save(cfg)
+    denv = _mock_discovery_env(sandbox)
+
+    # Isolate host autostart & split-install checks during TUI test
+    _ok_auto = AutostartStatus(platform="windows", enabled=False, healthy=True, mechanism="mock", artifact_path="mock")
+    _ok_split = SplitInstallReport(current_version=__version__, has_version_drift=False)
+    monkeypatch.setattr("agentsync.engine.diagnostics.autostart_status", lambda *_a, **_kw: _ok_auto)
+    monkeypatch.setattr("agentsync.engine.diagnostics.detect_split_installations", lambda *_a, **_kw: _ok_split)
+    monkeypatch.setattr("agentsync.tui.app.autostart_status", lambda *_a, **_kw: _ok_auto)
+
+    async def _run() -> None:
+        tui = AgentSyncApp(
+            config_path=cfg_file,
+            data_dir=cfg.resolved_data_dir(),
+            discovery_env=denv,
+            check_processes=False,
+            show_onboarding=False,
+            check_updates_on_mount=False,
+        )
+        async with tui.run_test(size=(130, 42)) as pilot:
+            await tui.workers.wait_for_complete()
+            await pilot.pause(0.15)
+
+            # 1. Clickable header [Health] pill navigates directly to Screen 6 (Auto-Diagnostics)
+            await pilot.click("#btn-health-badge")
+            await tui.workers.wait_for_complete()
+            await pilot.pause(0.15)
+            assert tui.query_one("#main-switcher", ContentSwitcher).current == "screen-health"
+            assert tui.last_diag_report is not None
+
+            # Queue fixable issues via [Auto-Fix on Close] button -> repair_queue.json
+            await pilot.click("#btn-health-repair-on-close")
+            await tui.workers.wait_for_complete()
+            await pilot.pause(0.15)
+            assert not load_repair_queue(cfg.repair_queue_path).is_empty
+
+            # 2. Settings Center (Screen 8): toggle Switches & Selects and confirm live persistence
+            await pilot.press("8")
+            await pilot.pause(0.15)
+            assert tui.query_one("#main-switcher", ContentSwitcher).current == "screen-settings"
+            assert "Daemon" in str(tui.query_one("#daemon-telemetry", Static).render()) or "STOPPED" in str(
+                tui.query_one("#daemon-telemetry", Static).render()
+            ).upper()
+
+            tui.query_one("#sw-realtime", Switch).value = False
+            tui.query_one("#sw-autoheal", Switch).value = False
+            tui.query_one("#sw-autobackup", Switch).value = False
+            tui.query_one("#sel-power-profile", Select).value = "instant"
+            tui.query_one("#sel-runtime-engine", Select).value = "python"
+            tui.query_one("#sel-update-policy", Select).value = "manual"
+            await pilot.pause(0.15)
+
+            # 3. UpdateModal: simulate available update -> click Remind Later -> click Skip Version
+            fake_upd = UpdateCheckResult(
+                current_version=__version__,
+                latest_version="9.9.9",
+                update_available=True,
+                install_method="pip",
+                release_notes="Test v9.9.9 release notes.",
+            )
+            tui._apply_update_info(fake_upd)
+            await pilot.pause(0.1)
+            upd_btn = tui.query_one("#btn-update-badge", Button)
+            assert upd_btn.has_class("visible") is True
+
+            # Click Update badge -> Remind Later
+            await pilot.click("#btn-update-badge")
+            await pilot.pause(0.15)
+            assert tui.screen.__class__.__name__ == "UpdateModal"
+            await pilot.click("#btn-upd-remind")
+            await pilot.pause(0.15)
+            assert tui.config.remind_update_after_utc is not None
+            assert upd_btn.has_class("visible") is False
+
+            # Re-show and choose Skip Version
+            tui._apply_update_info(fake_upd)
+            await pilot.pause(0.1)
+            await pilot.click("#btn-update-badge")
+            await pilot.pause(0.15)
+            assert tui.screen.__class__.__name__ == "UpdateModal"
+            await pilot.click("#btn-upd-skip")
+            await pilot.pause(0.15)
+            assert tui.config.skipped_update_version == "9.9.9"
+            assert upd_btn.has_class("visible") is False
+
+    asyncio.run(_run())
+
+    reloaded = ConfigManager(cfg_file).load()
+    assert reloaded.realtime_sync_enabled is False
+    assert reloaded.auto_heal_on_close is False
+    assert reloaded.auto_backup is False
+    assert reloaded.power_profile == "instant"
+    assert reloaded.runtime_engine == "python"
+    assert reloaded.update_policy == "manual"
+    assert reloaded.skipped_update_version == "9.9.9"
+    assert reloaded.remind_update_after_utc is not None

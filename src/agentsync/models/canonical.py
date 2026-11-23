@@ -32,8 +32,12 @@ def normalize_text_for_hash(text: str) -> str:
 # --- Skills ---
 
 
+_SIMPLE_FM_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):\s*([^:#\[\]{}'\"|>!*&][^\r\n]*)$")
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
 def parse_skill_md(content: str, folder_name: str) -> tuple[dict[str, Any], str, bool]:
-    """Parse SKILL.md into `(frontmatter_dict, body, had_frontmatter)`."""
+    """Parse SKILL.md into `(frontmatter_dict, body, had_frontmatter)` with fast-path for flat frontmatter."""
     cleaned = content.lstrip("\ufeff")
     if cleaned.startswith("---"):
         lines = cleaned.splitlines()
@@ -43,8 +47,27 @@ def parse_skill_md(content: str, folder_name: str) -> tuple[dict[str, Any], str,
                 end_idx = idx
                 break
         if end_idx is not None:
-            fm_text = "\n".join(lines[1:end_idx])
+            fm_lines = lines[1:end_idx]
             body = "\n".join(lines[end_idx + 1 :]).lstrip("\r\n")
+            # Fast-path O(N) parse for simple flat key: value frontmatter (avoids slow yaml.safe_load for 95% of skills)
+            fast_dict: dict[str, Any] = {}
+            fast_ok = True
+            for ln in fm_lines:
+                s = ln.strip()
+                if not s or s.startswith("#"):
+                    continue
+                m = _SIMPLE_FM_LINE_RE.match(ln)
+                if not m:
+                    fast_ok = False
+                    break
+                val = m.group(2).strip()
+                if val.lower() in ("true", "false", "null", "~") or val[0].isdigit():
+                    fast_ok = False
+                    break
+                fast_dict[m.group(1)] = val
+            if fast_ok and fast_dict:
+                return fast_dict, body, True
+            fm_text = "\n".join(fm_lines)
             try:
                 parsed = yaml.safe_load(fm_text)
                 if isinstance(parsed, dict):
@@ -406,7 +429,7 @@ class ChatMessage(BaseModel):
 
 
 def _normalize_msg_for_fingerprint(text: str) -> str:
-    collapsed = re.sub(r"\s+", " ", text.replace("\r\n", "\n")).strip().lower()
+    collapsed = _WS_COLLAPSE_RE.sub(" ", text.replace("\r\n", "\n")).strip().lower()
     return collapsed[:500]
 
 

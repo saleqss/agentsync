@@ -82,8 +82,8 @@ class DiffModal(ModalScreen[None]):
             self.dismiss(None)
 
 
-class UpdateModal(ModalScreen[bool]):
-    """Modal displaying release details and asking to confirm in-place self-update."""
+class UpdateModal(ModalScreen[str]):
+    """Modal displaying release changelog with Update Now, Remind Later, Skip Version, and Cancel."""
 
     def __init__(self, info: UpdateCheckResult) -> None:
         super().__init__()
@@ -102,12 +102,22 @@ class UpdateModal(ModalScreen[bool]):
             yield Label(t("modal.update_title"), classes="section-title")
             with VerticalScroll(id="diff-scroll"):
                 yield Static(body, markup=False)
-            with Container(classes="action-grid-3"):
+            with Container(classes="action-grid"):
                 yield Button(t("modal.update_confirm"), id="btn-upd-confirm", variant="success")
+                yield Button(t("modal.update_remind"), id="btn-upd-remind", variant="primary")
+                yield Button(t("modal.update_skip"), id="btn-upd-skip", variant="warning")
                 yield Button(t("modal.cancel"), id="btn-upd-cancel", variant="default")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "btn-upd-confirm")
+        bid = event.button.id or ""
+        if bid == "btn-upd-confirm":
+            self.dismiss("update")
+        elif bid == "btn-upd-remind":
+            self.dismiss("remind")
+        elif bid == "btn-upd-skip":
+            self.dismiss("skip")
+        else:
+            self.dismiss("cancel")
 
 
 class OnboardingModal(ModalScreen[dict[str, Any]]):

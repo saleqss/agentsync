@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agentsync import __version__
+from agentsync.accel import runtime_engine_label
 from agentsync.adapters.base import ToolAdapter
 from agentsync.config import AgentSyncConfig
 from agentsync.engine.doctor import DoctorEngine
@@ -73,6 +74,7 @@ def create_support_bundle(
 
     env_payload = {
         "agentsync_version": __version__,
+        "runtime_engine": runtime_engine_label(config.runtime_engine),
         "python_version": platform.python_version(),
         "platform": sys.platform,
         "os_name": env.os_name,

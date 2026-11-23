@@ -141,12 +141,20 @@ def test_cli_end_to_end_commands(sandbox: dict[str, Any], monkeypatch: pytest.Mo
     cfg_file: Path = sandbox["config_file"]
     ConfigManager(cfg_file).save(cfg)
 
-    # Mock running-process detection to return empty inside CLI tests
+    # Mock running-process, host autostart, and split-install checks so sandbox CLI test is host-independent
+    from agentsync.engine.autostart import AutostartStatus, SplitInstallReport
+
     monkeypatch.setattr("agentsync.engine.sync.assert_apps_closed", lambda **_kw: [])
     monkeypatch.setattr("agentsync.engine.bootstrap.assert_apps_closed", lambda **_kw: [])
     monkeypatch.setattr("agentsync.engine.doctor.assert_apps_closed", lambda **_kw: [])
     monkeypatch.setattr("agentsync.state.backup.assert_apps_closed", lambda **_kw: [])
     monkeypatch.setattr("agentsync.cli.detect_running_apps", lambda **_kw: [])
+    _ok_auto = AutostartStatus(platform="windows", enabled=False, healthy=True, mechanism="mock", artifact_path="mock")
+    _ok_split = SplitInstallReport(current_version=__version__, has_version_drift=False, summary="ok")
+    monkeypatch.setattr("agentsync.engine.diagnostics.autostart_status", lambda *_a, **_kw: _ok_auto)
+    monkeypatch.setattr("agentsync.engine.diagnostics.detect_split_installations", lambda *_a, **_kw: _ok_split)
+    monkeypatch.setattr("agentsync.cli.autostart_status", lambda *_a, **_kw: _ok_auto)
+    monkeypatch.setattr("agentsync.cli.detect_split_installations", lambda *_a, **_kw: _ok_split)
 
     # --version
     res_ver = runner.invoke(app, ["--version"])
@@ -202,10 +210,24 @@ def test_cli_end_to_end_commands(sandbox: dict[str, Any], monkeypatch: pytest.Mo
     assert res_sync.exit_code == 0
     assert "0 diff" in res_sync.output
 
+    # config list / set / get & daemon status
+    res_cfg_list = runner.invoke(app, ["config", "list", "--config", str(cfg_file)])
+    assert res_cfg_list.exit_code == 0
+    assert "power_profile" in res_cfg_list.output
+    res_cfg_set = runner.invoke(app, ["config", "set", "power_profile", "instant", "--config", str(cfg_file)])
+    assert res_cfg_set.exit_code == 0
+    res_cfg_get = runner.invoke(app, ["config", "get", "power_profile", "--config", str(cfg_file)])
+    assert res_cfg_get.exit_code == 0
+    assert "instant" in res_cfg_get.output
+    res_daemon = runner.invoke(app, ["daemon", "status", "--config", str(cfg_file)])
+    assert res_daemon.exit_code == 0
+    assert "STOPPED" in res_daemon.output
+
     # status
     res_status = runner.invoke(app, ["status", "--config", str(cfg_file)])
     assert res_status.exit_code == 0
     assert "Available Backups" in res_status.output
+    assert "Runtime Engine" in res_status.output
 
     # restore latest backup
     backups = BackupManager(cfg).list_backups()

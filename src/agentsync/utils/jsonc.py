@@ -7,94 +7,13 @@ import re
 from pathlib import Path
 from typing import Any
 
+from agentsync.accel import strip_jsonc_fast
 from agentsync.utils.atomic_io import atomic_write_text
 
 
 def strip_jsonc_comments(text: str) -> str:
     """Strip `//` line comments, `/* */` block comments, and trailing commas outside JSON strings."""
-    out: list[str] = []
-    i = 0
-    n = len(text)
-    in_str = False
-    escaped = False
-
-    while i < n:
-        ch = text[i]
-        if in_str:
-            out.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_str = False
-            i += 1
-            continue
-
-        if ch == '"':
-            in_str = True
-            out.append(ch)
-            i += 1
-            continue
-
-        # Line comment //
-        if ch == "/" and i + 1 < n and text[i + 1] == "/":
-            i += 2
-            while i < n and text[i] not in ("\n", "\r"):
-                i += 1
-            continue
-
-        # Block comment /* ... */
-        if ch == "/" and i + 1 < n and text[i + 1] == "*":
-            i += 2
-            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
-                if text[i] == "\n":
-                    out.append("\n")
-                i += 1
-            i += 2
-            continue
-
-        out.append(ch)
-        i += 1
-
-    no_comments = "".join(out)
-    # Remove trailing commas before `}` or `]` outside strings
-    return _strip_trailing_commas(no_comments)
-
-
-def _strip_trailing_commas(text: str) -> str:
-    out: list[str] = []
-    i = 0
-    n = len(text)
-    in_str = False
-    escaped = False
-    while i < n:
-        ch = text[i]
-        if in_str:
-            out.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_str = False
-            i += 1
-            continue
-        if ch == '"':
-            in_str = True
-            out.append(ch)
-            i += 1
-            continue
-        if ch == ",":
-            j = i + 1
-            while j < n and text[j] in (" ", "\t", "\r", "\n"):
-                j += 1
-            if j < n and text[j] in ("}", "]"):
-                i += 1
-                continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
+    return strip_jsonc_fast(text)
 
 
 def loads_jsonc(text: str) -> Any:

@@ -20,6 +20,19 @@ from agentsync.models.canonical import ChatMessage, ChatSession
 from agentsync.utils.paths import path_to_file_uri, to_native_path
 
 
+@pytest.fixture(autouse=True)
+def _guard_host_autostart_mutations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guarantee pytest can never accidentally modify the real host OS Task Scheduler / launchd / systemd."""
+
+    def _block(*_a: object, **_kw: object) -> None:
+        raise RuntimeError("Tests must mock enable_autostart/disable_autostart instead of mutating host OS autostart")
+
+    monkeypatch.setattr("agentsync.engine.autostart.enable_autostart", _block)
+    monkeypatch.setattr("agentsync.engine.autostart.disable_autostart", _block)
+    monkeypatch.setattr("agentsync.tui.app.enable_autostart", _block)
+    monkeypatch.setattr("agentsync.tui.app.disable_autostart", _block)
+
+
 def create_skill(
     skills_dir: Path,
     name: str,

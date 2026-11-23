@@ -168,6 +168,24 @@ Select > SelectCurrent {
     background: #238636;
 }
 
+#btn-health-badge {
+    background: #238636;
+    color: #ffffff;
+    min-width: 11;
+    height: 1;
+    padding: 0 1;
+    margin: 0 1 0 0;
+    text-style: bold;
+}
+
+#btn-health-badge.warn {
+    background: #9e6a03;
+}
+
+#btn-health-badge.err {
+    background: #da3633;
+}
+
 #btn-update-badge {
     display: none;
     background: #8957e5;
@@ -181,6 +199,14 @@ Select > SelectCurrent {
 
 #btn-update-badge.visible {
     display: block;
+}
+
+#daemon-telemetry {
+    background: #0d1117;
+    border: solid #30363d;
+    padding: 0 1;
+    margin-bottom: 1;
+    color: #79c0ff;
 }
 
 #env-badge {
@@ -413,6 +439,10 @@ Screen.compact #main-switcher {
 
 Screen.compact #env-badge {
     display: none;
+}
+
+Screen.compact #btn-health-badge {
+    min-width: 8;
 }
 
 Screen.compact .card {

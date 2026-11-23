@@ -4,6 +4,37 @@ All notable changes to **AgentSync** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-23
+
+### Fixed
+- **Windows Autostart Error (`Cannot find script file "...agentsync-daemon.vbs"`) & MSIX Store Python Virtualization:**
+  - Permanently removed all VBScript (`.vbs`) and `wscript.exe` generation from the codebase.
+  - Added a native windowless `[project.gui-scripts]` entry point (`agentsyncw = "agentsync.daemon:main"`) with resolution priority `agentsyncw.exe` -> `pythonw.exe -m agentsync.daemon` -> `python.exe -m agentsync.daemon` (zero console flash, zero WSH/VBS dependency).
+  - Replaced `schtasks /TR` command-line registration with UTF-16 XML Task Scheduler definitions (`schtasks /Create /XML`) staged outside MSIX-virtualized `%LOCALAPPDATA%` (`~/.agentsync/.agentsync-task.xml`), eliminating broken Cyrillic/Unicode paths and Store Python `LocalCache` visibility mismatches.
+  - Added pre- and post-registration task verification plus automatic legacy launcher cleanup across Scheduled Tasks, `%LOCALAPPDATA%\agentsync`, Store Python `LocalCache`, Startup folder, and `HKCU\...\Run`.
+- **Split-Installation Drift & Windows `WinError 32` Self-Update Lock:**
+  - Added `detect_split_installations()` to detect version drift between global PATH `agentsync.exe`, active `.venv`, and the registered autostart target.
+  - Replaced locked in-place Windows upgrades with a detached pure-PowerShell updater helper (zero `.vbs`) that waits for the parent PID to exit, stops the daemon cleanly, upgrades and unifies split installations, verifies `--version`, refreshes native autostart, restarts the daemon, and optionally relaunches the TUI.
+
+### Added
+- **Single-Instance Native Background Daemon (`agentsync daemon`):**
+  - Added `agentsync daemon start | stop | restart | pause | resume | status | run` backed by OS-level locking (`msvcrt.locking` / `fcntl.flock` with stale dead-PID reclaim), live telemetry (`daemon_state.json`), IPC control (`daemon_control.json`), low process priority (`BELOW_NORMAL_PRIORITY_CLASS` / `nice(10)`), exponential backoff (`2s` to `60s`), and rotating `daemon.log`.
+- **Continuous Auto-Diagnostics & Deferred Self-Healing (`repair --on-close`):**
+  - Added `DiagnosticsEngine` checking autostart health, legacy `.vbs` leftovers, split-installation drift, daemon lock/log health, all 3 Codex SQLite DBs + Antigravity DBs/indexes, rollouts, configs, symlinks, duplicates, and backups.
+  - Added clickable live header `[Health: OK / N issue(s)]` pill opening Screen 6 (`Auto-Diagnostics & Deferred Self-Healing`) with `[Fix Now]` and `[Auto-Fix on Close]`.
+  - Added persistent `repair_queue.json` and `agentsync repair --on-close` so the background daemon automatically executes verified repairs ~2.5s after locking apps exit.
+- **Split-Tier Real-Time Sync Engine & Ultra-Low Idle Footprint:**
+  - Split filesystem events into **Tier 1** (unlocked skills, instructions, plugins, MCP configs — synced in real time even while AI apps are open) and **Tier 2** (SQLite DBs, protobuf stores, sessions — safely queued for `Sync-on-Close`).
+  - Replaced continuous idle process polling with `threading.Condition` zero-idle sleep when both pending sync and repair queues are empty.
+  - Added incremental `DirtyFileCache` (`path -> (mtime_ns, size, sha256)`) with short-window self-write suppression and configurable Power Profiles (`Eco` / `Instant` / `Battery-Safe`) that hot-reload live on `config.toml` changes.
+- **Hot-Path Optimization & Optional Rust (`fast-anything` / PyO3) Boundary:**
+  - Added `agentsync.accel` exposing an optional compiled Rust (`_agentsync_rs`) boundary with automatic `Pure Python` fallback (`FAST_ANYTHING_DISABLE=1` / `runtime_engine = "python"`).
+  - Accelerated `SKILL.md` flat frontmatter parsing (~39x faster on 250-skill batches), compiled JSONC comment stripping (~1.6x faster), and fast streaming JSONL rollout validation (~10.6 ms per 2 MB rollout) in pure Python while maintaining bit-for-bit parity.
+- **Complete Live Settings Center & CLI Configuration (`agentsync config`):**
+  - Expanded TUI Screen 8 with a live Daemon telemetry card (Start / Stop / Restart / Open Log) plus live hot-reloading controls for Autostart, Real-Time Sync, Sync-on-Close, Auto-Diagnostics, Auto-Heal on Close, Power Profile, Debounce Delay, Patch Mode, Auto-Backup, Skill Link Strategy, Runtime Engine, Auto-Scan, Strip Secrets, Strict-Vocab, Update Policy/Channel, OS Notifications, and live EN/RU/ZH switching.
+  - Added `agentsync config list | get <key> | set <key> <value>` with automatic daemon hot-reload.
+  - Upgraded `UpdateModal` with `[Update Now]`, `[Remind Later]` (24h), and `[Skip Version]` persisted in `config.toml` alongside 6-hour cached release checks.
+
 ## [0.4.0] - 2026-11-22
 
 ### Fixed
