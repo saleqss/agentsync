@@ -85,13 +85,12 @@ def resolve_daemon_command(
         extra_args.extend(["--data-dir", str(data_dir)])
 
     if executable_override:
-        ov = Path(executable_override)
-        low = ov.name.lower()
+        low = executable_override.replace("\\", "/").rsplit("/", 1)[-1].lower()
         if low.startswith("agentsyncw"):
-            return str(ov), extra_args
+            return executable_override, extra_args
         if low.startswith("agentsync"):
-            return str(ov), ["daemon", "run", *extra_args]
-        return str(ov), ["-m", "agentsync.daemon", *extra_args]
+            return executable_override, ["daemon", "run", *extra_args]
+        return executable_override, ["-m", "agentsync.daemon", *extra_args]
 
     py_path = Path(sys.executable)
     scripts_dir = py_path.parent
