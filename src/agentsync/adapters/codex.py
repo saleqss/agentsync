@@ -29,6 +29,7 @@ from agentsync.models.canonical import (
     ProjectItem,
     RepairResult,
     SkillItem,
+    compute_chat_content_hash,
     parse_skill_md,
 )
 from agentsync.utils.atomic_io import (
@@ -349,7 +350,7 @@ def validate_codex_rollout_file(path: Path) -> list[str]:
             if payload.get("originator") == "agy-codex-sync" or payload.get("cli_version") == "agy-codex-sync":
                 errors.append("Legacy broken originator/cli_version 'agy-codex-sync' (causes infinite spinner)")
 
-    if scan["has_response_msg"]:
+    if scan["has_response_msg"] and "_" not in path.stem:
         missing_events = []
         if not scan["has_task_started"]:
             missing_events.append("task_started")
@@ -1012,6 +1013,25 @@ class CodexAdapter(ToolAdapter):
 
         return projects
 
+    def needs_project_sidebar_sync(self, projects: dict[str, ProjectItem]) -> bool:
+        """Check whether .codex-global-state.json unified-sidebar-project-order-v1 is missing any project."""
+        if not self.global_state_json.exists() or not projects:
+            return False
+        gs = self._load_global_state()
+        local_projects = gs.get("local-projects") or {}
+        atoms = gs.get("electron-persisted-atom-state")
+        if not isinstance(atoms, dict) or "unified-sidebar-project-order-v1" not in atoms:
+            return False
+        unified_order = set(atoms.get("unified-sidebar-project-order-v1") or [])
+        for lid in local_projects:
+            if f"codex:project:{lid}" not in unified_order:
+                return True
+        for item in projects.values():
+            lid = item.secondary_id(self.tool_name)
+            if lid and f"codex:project:{lid}" not in unified_order:
+                return True
+        return False
+
     def write_projects(
         self, projects: dict[str, ProjectItem]
     ) -> tuple[bool, dict[str, ProjectItem]]:
@@ -1166,6 +1186,31 @@ class CodexAdapter(ToolAdapter):
             if isinstance(assign, dict) and assign.get("projectId") in legacy_dup_remap:
                 assign["projectId"] = legacy_dup_remap[assign["projectId"]]
         gs["thread-project-assignments"] = tpa
+
+        atoms = gs.get("electron-persisted-atom-state")
+        if isinstance(atoms, dict):
+            atoms = dict(atoms)
+            old_unified_order = list(atoms.get("unified-sidebar-project-order-v1") or [])
+            new_unified_order: list[str] = []
+            for entry in old_unified_order:
+                if isinstance(entry, str) and entry.startswith("codex:project:"):
+                    raw_lid = entry.removeprefix("codex:project:")
+                    mlid = legacy_dup_remap.get(raw_lid, raw_lid)
+                    if mlid in new_local_projects:
+                        prefixed = f"codex:project:{mlid}"
+                        if prefixed not in new_unified_order:
+                            new_unified_order.append(prefixed)
+                elif isinstance(entry, str) and entry not in new_unified_order:
+                    new_unified_order.append(entry)
+            for lid in new_order:
+                prefixed = f"codex:project:{lid}"
+                if prefixed not in new_unified_order:
+                    new_unified_order.append(prefixed)
+                exp_key = f"sidebar-project-expanded-v1-codex:{lid}"
+                if exp_key not in atoms:
+                    atoms[exp_key] = True
+            atoms["unified-sidebar-project-order-v1"] = new_unified_order
+            gs["electron-persisted-atom-state"] = atoms
 
         if self._save_global_state(gs):
             changed = True
@@ -1339,6 +1384,29 @@ class CodexAdapter(ToolAdapter):
             finally:
                 hconn.close()
 
+        cat_by_tid: dict[str, dict[str, Any]] = {}
+        if self.codex_db.exists():
+            cconn = sqlite_safe_connect(self.codex_db, readonly=True)
+            cconn.row_factory = sqlite3.Row
+            try:
+                ctables = {
+                    r[0]
+                    for r in cconn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                if "local_thread_catalog" in ctables:
+                    for cr in cconn.execute(
+                        "SELECT thread_id, cwd, project_id, thread_source FROM local_thread_catalog WHERE host_id = 'local'"
+                    ).fetchall():
+                        cat_by_tid[str(cr["thread_id"])] = {
+                            "cwd": cr["cwd"],
+                            "project_id": cr["project_id"],
+                            "thread_source": cr["thread_source"],
+                        }
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                cconn.close()
+
         sessions: list[ChatSession] = []
         for row in thread_rows:
             tid = row["id"]
@@ -1350,6 +1418,7 @@ class CodexAdapter(ToolAdapter):
             proj_key: str | None = None
             proj_path: str | None = None
             native_pid: str | None = row["project_id"]
+            cat_row = cat_by_tid.get(tid)
 
             if native_pid and native_pid in pid_to_proj:
                 proj_key, proj_path = pid_to_proj[native_pid]
@@ -1364,13 +1433,65 @@ class CodexAdapter(ToolAdapter):
                         proj_key = path_dedup_key(roots[0])
                         proj_path = normalize_path(roots[0])
                         native_pid = lid
-            elif tid not in projectless_ids:
-                norm_cwd = normalize_path(row["cwd"] or "")
-                if norm_cwd and "/documents/codex/" not in norm_cwd.lower():
+            if not proj_key and cat_row and cat_row.get("project_id") in pid_to_proj:
+                proj_key, proj_path = pid_to_proj[cat_row["project_id"]]
+                native_pid = cat_row["project_id"]
+            if not proj_key:
+                raw_cand_cwd = row["cwd"] or (cat_row.get("cwd") if cat_row else "") or ""
+                norm_cwd = normalize_path(raw_cand_cwd)
+                if (
+                    norm_cwd
+                    and "/documents/codex/" not in norm_cwd.lower()
+                    and not norm_cwd.lower().endswith("/.codex/synced-chats")
+                ):
                     ck = path_dedup_key(norm_cwd)
                     if ck in projects_by_key:
                         proj_key = ck
                         proj_path = projects_by_key[ck].display_path
+                    elif tid not in projectless_ids and Path(to_native_path(norm_cwd)).is_dir():
+                        proj_key = ck
+                        proj_path = norm_cwd
+
+            raw_cwd_str = str(row["cwd"] or "")
+            raw_rp_str = str(row["rollout_path"] or "")
+            is_legacy_row = (
+                row["cli_version"] in ("agy-codex-sync", "agentsync")
+                or row["originator"] in ("agy-codex-sync", "agentsync")
+            )
+            needs_repair = False
+            if raw_cwd_str.startswith("\\\\?\\") or raw_rp_str.startswith("\\\\?\\"):
+                needs_repair = True
+            if is_legacy_row and raw_rp_str and not Path(to_native_path(raw_rp_str)).exists():
+                needs_repair = True
+            if proj_key:
+                p_item = projects_by_key.get(proj_key)
+                exp_pid = p_item.primary_id(self.tool_name) if p_item else None
+                exp_lid = p_item.secondary_id(self.tool_name) if p_item else None
+                exp_cwd = (
+                    to_native_path(p_item.display_path)
+                    if p_item
+                    else (to_native_path(proj_path) if proj_path else "")
+                )
+                if not exp_pid or row["project_id"] != exp_pid:
+                    needs_repair = True
+                if exp_cwd and raw_cwd_str != exp_cwd:
+                    needs_repair = True
+                if self.codex_db.exists():
+                    if (
+                        cat_row is None
+                        or cat_row.get("project_id") != exp_pid
+                        or cat_row.get("thread_source") != "user"
+                        or (exp_cwd and cat_row.get("cwd") != exp_cwd)
+                    ):
+                        needs_repair = True
+                if exp_lid:
+                    cur_tpa = tpa.get(tid)
+                    if not isinstance(cur_tpa, dict) or cur_tpa.get("projectId") != exp_lid:
+                        needs_repair = True
+                    if tid in projectless_ids:
+                        needs_repair = True
+            elif self.codex_db.exists() and (cat_row is None or cat_row.get("thread_source") != "user"):
+                needs_repair = True
 
             messages = msgs_by_thread.get(tid) or []
             if not messages and row["rollout_path"]:
@@ -1403,6 +1524,7 @@ class CodexAdapter(ToolAdapter):
                     is_subagent=is_subagent,
                     parent_id=parent_id,
                     messages=messages,
+                    needs_repair=needs_repair,
                 ).compute_hashes()
             )
         return sessions
@@ -1682,6 +1804,42 @@ class CodexAdapter(ToolAdapter):
         rollout_text = "\n".join(lines) + "\n"
         return rollout_text, turn_records, byte_offset, ordinal
 
+    def _ensure_project_registered(
+        self,
+        chat: ChatSession,
+        projects_by_key: dict[str, ProjectItem],
+        created_ms: int,
+        updated_ms: int,
+    ) -> ProjectItem | None:
+        """Ensure chat's project is present in projects_by_key and registered in Codex state + sidebar order."""
+        pkey = chat.project_key
+        if not pkey and chat.project_path:
+            pkey = path_dedup_key(chat.project_path)
+        if not pkey:
+            return None
+        if pkey not in projects_by_key and chat.project_path:
+            norm_p = normalize_path(chat.project_path)
+            if norm_p:
+                projects_by_key[pkey] = ProjectItem(
+                    canonical_key=pkey,
+                    display_path=norm_p,
+                    name=Path(to_native_path(norm_p)).name or norm_p,
+                    created_at_ms=created_ms,
+                    updated_at_ms=updated_ms,
+                )
+        project = projects_by_key.get(pkey)
+        if project is None:
+            return None
+        if (
+            not project.primary_id(self.tool_name)
+            or not project.secondary_id(self.tool_name)
+            or self.needs_project_sidebar_sync(projects_by_key)
+        ):
+            _, updated_projs = self.write_projects(projects_by_key)
+            projects_by_key.update(updated_projs)
+            project = projects_by_key.get(pkey)
+        return project
+
     def write_chat(
         self,
         chat: ChatSession,
@@ -1694,13 +1852,17 @@ class CodexAdapter(ToolAdapter):
         created_sec = created_ms // 1000
         updated_sec = updated_ms // 1000
 
-        project = projects_by_key.get(chat.project_key) if chat.project_key else None
+        project = self._ensure_project_registered(chat, projects_by_key, created_ms, updated_ms)
         codex_pid = project.primary_id(self.tool_name) if project else None
         codex_lid = project.secondary_id(self.tool_name) if project else None
         cwd_native = (
             to_native_path(project.display_path)
             if project
-            else to_native_path(str(self.root_path / "synced-chats"))
+            else (
+                to_native_path(chat.project_path)
+                if chat.project_path
+                else to_native_path(str(self.root_path / "synced-chats"))
+            )
         )
         defaults = self._detect_native_thread_defaults()
 
@@ -1708,47 +1870,95 @@ class CodexAdapter(ToolAdapter):
         rel_dir = self.sessions_dir / f"{dt.year:04d}" / f"{dt.month:02d}" / f"{dt.day:02d}"
         rollout_file = rel_dir / f"rollout-{dt.strftime('%Y-%m-%dT%H-%M-%S')}-{tid}.jsonl"
 
+        existing_cwd_in_db: str | None = None
+        existing_is_native = False
         if self.state_db.exists():
             rconn = sqlite_safe_connect(self.state_db, readonly=True)
             rconn.row_factory = sqlite3.Row
             try:
                 existing_row = rconn.execute(
-                    "SELECT rollout_path FROM threads WHERE id = ?", (tid,)
+                    "SELECT rollout_path, cwd, cli_version, originator, history_mode FROM threads WHERE id = ?",
+                    (tid,),
                 ).fetchone()
-                if existing_row and existing_row["rollout_path"]:
-                    existing_rp = Path(to_native_path(existing_row["rollout_path"]))
-                    if str(self.sessions_dir).lower() in str(existing_rp).lower():
-                        rollout_file = existing_rp
+                if existing_row:
+                    existing_cwd_in_db = str(existing_row["cwd"] or "")
+                    existing_is_native = (
+                        existing_row["cli_version"] not in ("agy-codex-sync", "agentsync", None, "")
+                        and existing_row["originator"] not in ("agy-codex-sync", "agentsync")
+                    )
+                    if existing_row["rollout_path"]:
+                        existing_rp = Path(to_native_path(existing_row["rollout_path"]))
+                        if str(self.sessions_dir).lower() in str(existing_rp).lower():
+                            rollout_file = existing_rp
             except sqlite3.OperationalError:
                 pass
             finally:
                 rconn.close()
 
-        rollout_text, turn_records, total_bytes, next_ordinal = self._build_conformant_rollout(
-            tid=tid,
-            cwd_native=cwd_native,
-            created_ms=created_ms,
-            updated_ms=updated_ms,
-            messages=chat.messages,
-            defaults=defaults,
-        )
+        # Check if rollout_file (or native paginated thread history) already exists and only needs metadata re-binding
+        preserve_existing_history = False
+        if project is None and existing_cwd_in_db:
+            norm_existing_cwd = normalize_path(existing_cwd_in_db)
+            if norm_existing_cwd:
+                cwd_native = to_native_path(norm_existing_cwd)
 
-        # Validate generated JSONL strictly before atomic replace
-        def _validate_jsonl(text: str) -> None:
-            raw_lines = [ln for ln in text.split("\n") if ln.strip()]
-            if not raw_lines:
-                raise ValueError("Empty Codex rollout JSONL")
-            first = json.loads(raw_lines[0])
-            if first.get("type") != "session_meta":
-                raise ValueError("Codex rollout line 1 is not session_meta")
-            pl = first.get("payload") or {}
-            for req in REQUIRED_SESSION_META_KEYS:
-                if not pl.get(req):
-                    raise ValueError(f"Codex session_meta missing required field '{req}'")
-            for ln in raw_lines[1:]:
-                json.loads(ln)
+        spinning_ids = {s_tid for s_tid, _, _ in self._detect_spinning_threads()}
+        if tid not in spinning_ids and rollout_file.exists() and not validate_codex_rollout_file(rollout_file):
+            existing_msgs = self._read_rollout_messages(rollout_file)
+            if existing_msgs and compute_chat_content_hash("", None, existing_msgs) == compute_chat_content_hash("", None, chat.messages):
+                try:
+                    raw_txt = rollout_file.read_text(encoding="utf-8", errors="replace")
+                    first_obj = json.loads(raw_txt.splitlines()[0])
+                    rollout_cwd = (first_obj.get("payload") or {}).get("cwd")
+                    has_native_rich_items = '"world_state"' in raw_txt or '"additional_tools"' in raw_txt
+                    if rollout_cwd == cwd_native or has_native_rich_items or existing_is_native:
+                        preserve_existing_history = True
+                except Exception:
+                    preserve_existing_history = False
+        elif tid not in spinning_ids and existing_is_native and not rollout_file.exists():
+            # Native historical thread whose rollout JSONL was pruned/archived while thread_history_1.sqlite holds its turns
+            if self.thread_history_db.exists():
+                hcheck = sqlite_safe_connect(self.thread_history_db, readonly=True)
+                try:
+                    hcnt = hcheck.execute(
+                        "SELECT count(*) FROM thread_items WHERE thread_id = ?", (tid,)
+                    ).fetchone()[0]
+                    if int(hcnt or 0) > 0:
+                        preserve_existing_history = True
+                except sqlite3.OperationalError:
+                    pass
+                finally:
+                    hcheck.close()
+            if not preserve_existing_history and len(chat.messages) <= 1 and existing_cwd_in_db is not None:
+                preserve_existing_history = True
 
-        changed = atomic_write_text(rollout_file, rollout_text, validator=_validate_jsonl)
+        changed = False
+        if not preserve_existing_history:
+            rollout_text, turn_records, total_bytes, next_ordinal = self._build_conformant_rollout(
+                tid=tid,
+                cwd_native=cwd_native,
+                created_ms=created_ms,
+                updated_ms=updated_ms,
+                messages=chat.messages,
+                defaults=defaults,
+            )
+
+            # Validate generated JSONL strictly before atomic replace
+            def _validate_jsonl(text: str) -> None:
+                raw_lines = [ln for ln in text.split("\n") if ln.strip()]
+                if not raw_lines:
+                    raise ValueError("Empty Codex rollout JSONL")
+                first = json.loads(raw_lines[0])
+                if first.get("type") != "session_meta":
+                    raise ValueError("Codex rollout line 1 is not session_meta")
+                pl = first.get("payload") or {}
+                for req in REQUIRED_SESSION_META_KEYS:
+                    if not pl.get(req):
+                        raise ValueError(f"Codex session_meta missing required field '{req}'")
+                for ln in raw_lines[1:]:
+                    json.loads(ln)
+
+            changed = atomic_write_text(rollout_file, rollout_text, validator=_validate_jsonl)
 
         first_user_msg = next(
             (m.text for m in chat.messages if m.role == "user" and m.text.strip()),
@@ -1759,6 +1969,24 @@ class CodexAdapter(ToolAdapter):
         ).strip()
 
         def _mutate_state_db(sconn: sqlite3.Connection) -> None:
+            if preserve_existing_history:
+                sconn.execute(
+                    """
+                    UPDATE threads
+                    SET rollout_path = ?,
+                        cwd = ?,
+                        project_id = ?,
+                        thread_source = COALESCE(NULLIF(thread_source, ''), 'user')
+                    WHERE id = ?
+                    """,
+                    (
+                        to_native_path(str(rollout_file)),
+                        cwd_native,
+                        codex_pid,
+                        tid,
+                    ),
+                )
+                return
             sconn.execute(
                 """
                 INSERT INTO threads(
@@ -1825,55 +2053,56 @@ class CodexAdapter(ToolAdapter):
         sqlite_transactional_edit(self.state_db, _mutate_state_db, ddl=_STATE_5_MIN_DDL)
         changed = True
 
-        def _mutate_history_db(hconn: sqlite3.Connection) -> None:
-            hconn.execute("DELETE FROM thread_items WHERE thread_id = ?", (tid,))
-            hconn.execute("DELETE FROM thread_turns WHERE thread_id = ?", (tid,))
-            for tr in turn_records:
-                hconn.execute(
-                    """
-                    INSERT INTO thread_turns(
-                        thread_id, turn_id, rollout_ordinal, status,
-                        started_at, completed_at, duration_ms,
-                        first_user_item_id, final_agent_item_id,
-                        rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset, root_turn_id
-                    ) VALUES(?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        tid,
-                        tr["turn_id"],
-                        tr["start_ord"],
-                        tr["started_at"],
-                        tr["completed_at"],
-                        tr["duration_ms"],
-                        tr["first_user_item_id"],
-                        tr["final_agent_item_id"],
-                        tr["start_byte"],
-                        tr["end_ord"],
-                        tr["end_byte"],
-                        tr["turn_id"],
-                    ),
-                )
-                for item_id, ord_i, mts, item_type, item_json in tr["items"]:
+        if not preserve_existing_history:
+            def _mutate_history_db(hconn: sqlite3.Connection) -> None:
+                hconn.execute("DELETE FROM thread_items WHERE thread_id = ?", (tid,))
+                hconn.execute("DELETE FROM thread_turns WHERE thread_id = ?", (tid,))
+                for tr in turn_records:
                     hconn.execute(
                         """
-                        INSERT INTO thread_items(
-                            thread_id, turn_id, item_id, rollout_ordinal,
-                            created_at_ms, item_json, item_type, updated_at_ordinal,
-                            started_at_ms, completed_at_ms
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO thread_turns(
+                            thread_id, turn_id, rollout_ordinal, status,
+                            started_at, completed_at, duration_ms,
+                            first_user_item_id, final_agent_item_id,
+                            rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset, root_turn_id
+                        ) VALUES(?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (tid, tr["turn_id"], item_id, ord_i, mts, item_json, item_type, ord_i, mts, mts),
+                        (
+                            tid,
+                            tr["turn_id"],
+                            tr["start_ord"],
+                            tr["started_at"],
+                            tr["completed_at"],
+                            tr["duration_ms"],
+                            tr["first_user_item_id"],
+                            tr["final_agent_item_id"],
+                            tr["start_byte"],
+                            tr["end_ord"],
+                            tr["end_byte"],
+                            tr["turn_id"],
+                        ),
                     )
-            hconn.execute(
-                """
-                INSERT OR REPLACE INTO thread_history_projection_state(
-                    thread_id, next_rollout_byte_offset, next_rollout_ordinal
-                ) VALUES(?, ?, ?)
-                """,
-                (tid, total_bytes, next_ordinal),
-            )
+                    for item_id, ord_i, mts, item_type, item_json in tr["items"]:
+                        hconn.execute(
+                            """
+                            INSERT INTO thread_items(
+                                thread_id, turn_id, item_id, rollout_ordinal,
+                                created_at_ms, item_json, item_type, updated_at_ordinal,
+                                started_at_ms, completed_at_ms
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (tid, tr["turn_id"], item_id, ord_i, mts, item_json, item_type, ord_i, mts, mts),
+                        )
+                hconn.execute(
+                    """
+                    INSERT OR REPLACE INTO thread_history_projection_state(
+                        thread_id, next_rollout_byte_offset, next_rollout_ordinal
+                    ) VALUES(?, ?, ?)
+                    """,
+                    (tid, total_bytes, next_ordinal),
+                )
 
-        sqlite_transactional_edit(self.thread_history_db, _mutate_history_db, ddl=_THREAD_HISTORY_MIN_DDL)
+            sqlite_transactional_edit(self.thread_history_db, _mutate_history_db, ddl=_THREAD_HISTORY_MIN_DDL)
 
         # Keep Codex Desktop's sqlite/codex.db local_thread_catalog consistent (WAL-safe + integrity checked)
         if self.codex_db.exists():
@@ -1902,14 +2131,15 @@ class CodexAdapter(ToolAdapter):
                     INSERT INTO local_thread_catalog(
                         host_id, thread_id, display_title, source_created_at, source_updated_at,
                         cwd, source_kind, model_provider, observation_sequence,
-                        missing_candidate, source_recency_at, pending_observed_title, project_id
-                    ) VALUES('local', ?, ?, ?, ?, ?, 'vscode', 'openai', ?, 0, ?, 0, ?)
+                        missing_candidate, thread_source, source_recency_at, pending_observed_title, project_id
+                    ) VALUES('local', ?, ?, ?, ?, ?, 'vscode', 'openai', ?, 0, 'user', ?, 0, ?)
                     ON CONFLICT(host_id, thread_id) DO UPDATE SET
                         display_title=excluded.display_title,
                         source_updated_at=excluded.source_updated_at,
                         cwd=excluded.cwd,
                         source_recency_at=excluded.source_recency_at,
                         missing_candidate=0,
+                        thread_source='user',
                         project_id=excluded.project_id
                     """,
                     (
@@ -2247,6 +2477,38 @@ class CodexAdapter(ToolAdapter):
                         )
                     )
 
+        # 9. Check unbound or partially bound threads & sidebar project ordering
+        try:
+            if projs and self.needs_project_sidebar_sync(projs):
+                issues.append(
+                    DoctorIssue(
+                        tool=self.tool_name,
+                        severity="warning",
+                        code="CODEX_UNBOUND_SYNCED_THREAD",
+                        path=str(self.global_state_json),
+                        message="Registered project(s) missing from Codex Desktop unified-sidebar-project-order-v1.",
+                        fixable=True,
+                    )
+                )
+            user_chats = self.read_chats(projs, include_subagents=False)
+            unbound_chats = [c for c in user_chats if c.needs_repair]
+            if unbound_chats:
+                issues.append(
+                    DoctorIssue(
+                        tool=self.tool_name,
+                        severity="warning",
+                        code="CODEX_UNBOUND_SYNCED_THREAD",
+                        path=str(self.state_db),
+                        message=(
+                            f"{len(unbound_chats)} thread(s) have incomplete project binding or unnormalized cwd "
+                            "across state_5.sqlite, codex.db, or .codex-global-state.json."
+                        ),
+                        fixable=True,
+                    )
+                )
+        except Exception:
+            pass
+
         return issues
 
     def repair(self, quarantine_dir: Path, dry_run: bool = False) -> RepairResult:
@@ -2324,22 +2586,28 @@ class CodexAdapter(ToolAdapter):
                     if ckpt_ok:
                         result.details.append(f"Checkpointed {label} WAL cleanly ({ckpt_msg})")
 
-        # 1. Deduplicate projects in state_5.sqlite if duplicates exist
+        # 1. Deduplicate projects in state_5.sqlite or sync unified-sidebar-project-order-v1 if needed
         try:
             projs = self.read_projects()
         except Exception:
             projs = {}
         has_dup_projects = any(p.duplicate_count(self.tool_name) > 0 for p in projs.values())
-        if has_dup_projects:
+        needs_sidebar = bool(projs) and self.needs_project_sidebar_sync(projs)
+        if has_dup_projects or needs_sidebar:
             if dry_run:
                 dup_cnt = sum(p.duplicate_count(self.tool_name) for p in projs.values())
-                result.fixed_count += dup_cnt
-                result.details.append(f"Would collapse {dup_cnt} duplicate project row(s) in state_5.sqlite")
+                result.fixed_count += max(1, dup_cnt)
+                if has_dup_projects:
+                    result.details.append(f"Would collapse {dup_cnt} duplicate project row(s) in state_5.sqlite")
+                if needs_sidebar:
+                    result.details.append("Would register all projects in unified-sidebar-project-order-v1")
             else:
                 changed, projs = self.write_projects(projs)
                 if changed:
                     result.fixed_count += 1
-                    result.details.append("Collapsed duplicate project rows in state_5.sqlite")
+                    result.details.append(
+                        "Synchronized project rows in state_5.sqlite and unified-sidebar-project-order-v1"
+                    )
 
         # 2. Clean broken symlinks inside ~/.codex/skills
         if self.skills_dir.exists():
@@ -2466,12 +2734,31 @@ class CodexAdapter(ToolAdapter):
                 result.details.append(
                     f"Would rebuild Codex hydration metadata for thread '{tid}' ({reason})"
                 )
+                repaired_tids.add(tid)
             else:
                 self.write_chat(chat, target_native_id=tid, projects_by_key=projs)
                 repaired_tids.add(tid)
                 result.fixed_count += 1
                 result.details.append(
                     f"Rebuilt Codex hydration rollout + SQLite indexes for thread '{tid}'"
+                )
+
+        # 6. Re-bind any unbound or partially bound user threads across state_5.sqlite, codex.db, and global state
+        for tid, chat in sorted(chats_by_id.items()):
+            if chat.is_subagent or tid in repaired_tids or not chat.needs_repair:
+                continue
+            if dry_run:
+                result.fixed_count += 1
+                result.details.append(
+                    f"Would re-bind project and normalize metadata for thread '{tid}' ({chat.title[:40]})"
+                )
+                repaired_tids.add(tid)
+            else:
+                self.write_chat(chat, target_native_id=tid, projects_by_key=projs)
+                repaired_tids.add(tid)
+                result.fixed_count += 1
+                result.details.append(
+                    f"Re-bound project and normalized metadata for thread '{tid}' ({chat.title[:40]})"
                 )
 
         return result

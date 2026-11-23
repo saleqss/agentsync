@@ -8,6 +8,9 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 _WIN_DRIVE_RE = re.compile(r"^([a-zA-Z]):(.*)$")
+_LEADING_SLASH_DRIVE_RE = re.compile(r"^/+([a-zA-Z]:(?:[/\\].*)?)$")
+_WSL_MNT_RE = re.compile(r"^(?:win32:)?/mnt/([a-zA-Z])(/.*)?$", re.IGNORECASE)
+_PERCENT_ENC_RE = re.compile(r"%[0-9a-fA-F]{2}")
 
 
 def strip_win_extended_prefix(raw: str) -> str:
@@ -23,14 +26,22 @@ def strip_win_extended_prefix(raw: str) -> str:
 def file_uri_to_path(uri: str) -> str:
     """Convert a `file:///` URI (including percent-encoded `c%3A` and UTF-8) to a local path."""
     s = uri.strip()
+    if s.lower().startswith("file/"):
+        s = "file:///" + s[5:].lstrip("/")
     if not s.lower().startswith("file://"):
+        if _PERCENT_ENC_RE.search(s):
+            s = unquote(unquote(s))
         return s
     parsed = urlparse(s)
-    raw_path = unquote(parsed.path)
+    raw_path = unquote(unquote(parsed.path))
     if parsed.netloc and parsed.netloc.lower() != "localhost":
-        return f"//{parsed.netloc}{raw_path}".replace("/", "\\")
-    if len(raw_path) >= 3 and raw_path[0] == "/" and raw_path[2] == ":":
-        raw_path = raw_path[1:]
+        netloc = unquote(parsed.netloc)
+        if _WIN_DRIVE_RE.match(netloc):
+            return f"{netloc}{raw_path}"
+        return f"//{netloc}{raw_path}".replace("/", "\\")
+    m_lead = _LEADING_SLASH_DRIVE_RE.match(raw_path)
+    if m_lead:
+        raw_path = m_lead.group(1)
     return raw_path
 
 
@@ -66,9 +77,19 @@ def normalize_path(raw: str) -> str:
         return ""
 
     s = raw.strip()
-    if s.lower().startswith("file://"):
+    if s.lower().startswith("file://") or s.lower().startswith("file/"):
         s = file_uri_to_path(s)
+    elif _PERCENT_ENC_RE.search(s) and ("c%3a" in s.lower() or "%2f" in s.lower() or "%5c" in s.lower() or "%d0%" in s.lower() or "%d1%" in s.lower()):
+        s = unquote(unquote(s))
     s = strip_win_extended_prefix(s)
+    m_wsl = _WSL_MNT_RE.match(s)
+    if m_wsl:
+        drive_letter = m_wsl.group(1).upper()
+        rest_wsl = m_wsl.group(2) or "/"
+        s = f"{drive_letter}:{rest_wsl}"
+    m_lead = _LEADING_SLASH_DRIVE_RE.match(s)
+    if m_lead:
+        s = m_lead.group(1)
 
     is_windows_style = bool(_WIN_DRIVE_RE.match(s)) or s.startswith("\\\\") or s.startswith("//")
     if is_windows_style:
@@ -131,6 +152,11 @@ def to_native_path(raw: str) -> str:
     if _WIN_DRIVE_RE.match(norm) or norm.startswith("//"):
         return norm.replace("/", "\\")
     return norm
+
+
+def canonical_windows_cwd(raw: str) -> str:
+    """Return canonical Windows working directory path (`C:\\Users\\...`) without `\\\\?\\` prefix."""
+    return to_native_path(raw)
 
 
 def path_to_file_uri(raw: str, encode_drive_colon: bool = True) -> str:

@@ -22,6 +22,8 @@ from agentsync.models.canonical import (
     SkillItem,
     SyncAction,
     SyncPlan,
+    compute_chat_content_hash,
+    compute_chat_fingerprint,
 )
 from agentsync.state.backup import BackupManager
 from agentsync.state.ledger import LedgerItem, LedgerStore
@@ -293,6 +295,24 @@ class SyncEngine:
                                 details={"canonical_key": key},
                             )
                         )
+
+        for a in active:
+            tname = a.tool_name
+            if (
+                tname not in tools_needing_write
+                and hasattr(a, "needs_project_sidebar_sync")
+                and a.needs_project_sidebar_sync(unified)
+            ):
+                tools_needing_write.add(tname)
+                plan.add(
+                    SyncAction(
+                        category="projects",
+                        action="UPDATE",
+                        target_tool=tname,
+                        entity_id="unified-sidebar-project-order-v1",
+                        summary=f"Register all workspaces in {tname} unified sidebar project order",
+                    )
+                )
 
         if not dry_run:
             for a in active:
@@ -1069,6 +1089,27 @@ class SyncEngine:
             if group_sessions:
                 groups.append((canon, group_sessions))
 
+        # Pass 1b: Attach unmapped counterpart sessions to incomplete Pass-1 groups by message fingerprint
+        for _canon, group_sessions in groups:
+            if len(group_sessions) >= len(active):
+                continue
+            ref_sess = next(iter(group_sessions.values()))
+            ref_msg_fp = compute_chat_fingerprint(None, ref_sess.messages, title=ref_sess.title)
+            for a in active:
+                tname = a.tool_name
+                if tname in group_sessions:
+                    continue
+                for nid, cand in chats_by_tool[tname].items():
+                    if nid in matched_ids[tname]:
+                        continue
+                    cand_msg_fp = compute_chat_fingerprint(None, cand.messages, title=cand.title)
+                    if cand.fingerprint == ref_sess.fingerprint or (
+                        cand.messages and ref_sess.messages and cand_msg_fp == ref_msg_fp
+                    ):
+                        group_sessions[tname] = cand
+                        matched_ids[tname].add(nid)
+                        break
+
         # Pass 2: Match remaining unmapped chats across tools by deterministic SHA-256 fingerprint
         fp_buckets: dict[str, list[dict[str, ChatSession]]] = {}
         for a in active:
@@ -1086,26 +1127,89 @@ class SyncEngine:
                 if not placed:
                     fp_buckets[sess.fingerprint].append({tname: sess})
 
-        for buckets in fp_buckets.values():
-            for bucket in buckets:
-                groups.append((None, bucket))
+        all_pass2_buckets: list[dict[str, ChatSession]] = [
+            bucket for buckets in fp_buckets.values() for bucket in buckets
+        ]
+
+        # Pass 2b: Merge single-tool buckets where one side lost project_key but message head matches
+        merged_pass2: list[dict[str, ChatSession]] = []
+        msg_fp_index: dict[str, list[dict[str, ChatSession]]] = {}
+        for bucket in all_pass2_buckets:
+            sess = next(iter(bucket.values()))
+            if len(bucket) == 1 and sess.messages:
+                msg_fp = compute_chat_fingerprint(None, sess.messages, title=sess.title)
+                tname = next(iter(bucket.keys()))
+                placed = False
+                for target_b in msg_fp_index.setdefault(msg_fp, []):
+                    if tname not in target_b:
+                        other_s = next(iter(target_b.values()))
+                        if sess.project_key is None or other_s.project_key is None or sess.project_key == other_s.project_key:
+                            target_b[tname] = sess
+                            placed = True
+                            break
+                if not placed:
+                    msg_fp_index[msg_fp].append(bucket)
+                    merged_pass2.append(bucket)
+            else:
+                merged_pass2.append(bucket)
+
+        for bucket in merged_pass2:
+            groups.append((None, bucket))
 
         # Pass 3: Reconcile each canonical chat group across all writable tools
         for canon, present in groups:
-            # Check strict idempotency
+            # Resolve authoritative project binding across all present sessions (preserve non-null binding)
+            bound_candidates = [s for s in present.values() if s.project_key]
+            best_project_key: str | None = None
+            best_project_path: str | None = None
+            if bound_candidates:
+                best_bound = max(bound_candidates, key=lambda s: s.updated_at_ms)
+                best_project_key = best_bound.project_key
+                best_project_path = best_bound.project_path
+            elif canon is not None and canon.project_key:
+                best_project_key = canon.project_key
+                if best_project_key in projects:
+                    best_project_path = projects[best_project_key].display_path
+
+            def _needs_binding_or_repair(s: ChatSession, _exp_pkey: str | None = best_project_key) -> bool:
+                if s.needs_repair:
+                    return True
+                if _exp_pkey and s.project_key != _exp_pkey:
+                    return True
+                return False
+
+            # Check strict idempotency (content hash + project binding + native store health)
             if (
                 canon is not None
                 and all(a.tool_name in present for a in writable_tools)
                 and all(
-                    t in canon.links and s.content_hash == canon.links[t].content_hash
+                    t in canon.links
+                    and s.content_hash == canon.links[t].content_hash
+                    and not _needs_binding_or_repair(s)
                     for t, s in present.items()
                 )
             ):
                 continue
 
+            msg_only_hashes = {
+                compute_chat_content_hash(s.title, None, s.messages) for s in present.values()
+            }
             unique_hashes = {s.content_hash for s in present.values()}
             if len(unique_hashes) == 1:
-                winner_tool, winner = next(iter(present.items()))
+                # Prefer a session that already has valid project binding and no repair needed
+                healthy = [
+                    (t, s) for t, s in present.items() if not _needs_binding_or_repair(s)
+                ]
+                winner_tool, winner = healthy[0] if healthy else next(iter(present.items()))
+                is_conflict = False
+            elif len(msg_only_hashes) == 1:
+                # Identical message content, only project_key differs -> pick the bound session without conflict
+                bound_items = [(t, s) for t, s in present.items() if s.project_key == best_project_key]
+                winner_tool, winner = (
+                    max(bound_items, key=lambda kv: kv[1].updated_at_ms)
+                    if bound_items
+                    else max(present.items(), key=lambda kv: kv[1].updated_at_ms)
+                )
                 is_conflict = False
             else:
                 changed = [
@@ -1125,12 +1229,20 @@ class SyncEngine:
                     winner_tool, winner = max(present.items(), key=lambda kv: kv[1].updated_at_ms)
                     is_conflict = len(present) > 1
 
+            if best_project_key and winner.project_key != best_project_key:
+                winner = winner.model_copy(deep=True)
+                winner.project_key = best_project_key
+                winner.project_path = best_project_path or (
+                    projects[best_project_key].display_path if best_project_key in projects else None
+                )
+                winner.compute_hashes()
+
             canonical_id = canon.canonical_id if canon else str(uuid.uuid4())
             updated_links: dict[str, ChatLinkRecord] = dict(canon.links) if canon else {}
 
-            # Ensure present matching tools are linked
+            # Ensure present matching tools that do NOT need binding/store repair are linked
             for tname, sess in present.items():
-                if sess.content_hash == winner.content_hash:
+                if sess.content_hash == winner.content_hash and not _needs_binding_or_repair(sess):
                     if canon is None or tname not in canon.links:
                         if len(present) > 1:
                             plan.add(
@@ -1151,10 +1263,14 @@ class SyncEngine:
                         updated_at_ms=sess.updated_at_ms,
                     )
 
-            # Propagate winner to every writable tool missing it or having stale/conflicting content
+            # Propagate winner to every writable tool missing it or having stale/conflicting/unbound state
             for a in writable_tools:
                 tname = a.tool_name
-                if tname in present and present[tname].content_hash == winner.content_hash:
+                if (
+                    tname in present
+                    and present[tname].content_hash == winner.content_hash
+                    and not _needs_binding_or_repair(present[tname])
+                ):
                     continue
                 existing_sess = present.get(tname)
                 act_kind = (

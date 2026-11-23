@@ -28,6 +28,7 @@ from agentsync.models.canonical import (
     ProjectItem,
     RepairResult,
     SkillItem,
+    compute_chat_content_hash,
     ensure_skill_frontmatter,
     parse_skill_md,
 )
@@ -36,6 +37,7 @@ from agentsync.utils.atomic_io import (
     atomic_write_text,
     remove_tree_if_exists,
     sqlite_safe_connect,
+    sqlite_wal_checkpoint,
     sync_directory_files,
 )
 from agentsync.utils.paths import (
@@ -52,6 +54,8 @@ from agentsync.utils.proto_wire import (
     encode_raw_summary,
     encode_trajectory_metadata,
     encode_user_input_step,
+    first_bytes,
+    first_str,
     first_varint,
     parse_wire,
     read_agyhub_summaries_pb,
@@ -978,6 +982,21 @@ class AntigravityAdapter(ToolAdapter):
             for k, p in projects_by_key.items()
             for pid in p.native_ids_by_tool.get(self.tool_name, [])
         }
+        if self.projects_dir.exists():
+            for pf in sorted(self.projects_dir.glob("*.json")):
+                pid_cand = pf.stem
+                if pid_cand not in pid_to_proj:
+                    try:
+                        pobj = json.loads(pf.read_text(encoding="utf-8-sig"))
+                        raw_p = pobj.get("path") or pobj.get("workspacePath") or ""
+                        if raw_p:
+                            pk = path_dedup_key(str(raw_p))
+                            if pk:
+                                pid_to_proj[pid_cand] = (pk, normalize_path(str(raw_p)))
+                    except Exception:
+                        pass
+
+        pb_entries = read_agyhub_summaries_pb(self.hub_summaries_pb)
 
         conn = sqlite_safe_connect(self.summaries_db, readonly=True)
         conn.row_factory = sqlite3.Row
@@ -1019,6 +1038,72 @@ class AntigravityAdapter(ToolAdapter):
             if not proj_key and native_pid and native_pid in pid_to_proj:
                 proj_key, proj_path = pid_to_proj[native_pid]
 
+            raw_s: bytes = bytes(row["raw_summary"] or b"")
+            raw_field_nums: set[int] = set()
+            tmb_pid = ""
+            tmb_ws = ""
+            if raw_s:
+                try:
+                    rfields = parse_wire(raw_s)
+                    raw_field_nums = {fn for fn, _, _ in rfields}
+                    f17 = first_bytes(rfields, 17)
+                    if f17:
+                        tmeta = decode_trajectory_metadata(f17)
+                        tmb_pid = str(tmeta.get("project_id") or "")
+                        tmb_ws = str(tmeta.get("workspace_uri") or "")
+                    if not tmb_ws:
+                        f9 = first_bytes(rfields, 9)
+                        if f9:
+                            tmb_ws = first_str(parse_wire(f9), 1) or ""
+                except Exception:
+                    pass
+
+            if not proj_key and tmb_ws:
+                proj_key = path_dedup_key(tmb_ws)
+                proj_path = normalize_path(tmb_ws)
+            if not proj_key and tmb_pid and tmb_pid in pid_to_proj:
+                proj_key, proj_path = pid_to_proj[tmb_pid]
+
+            # Fallback to conversations/<cid>.db trajectory_metadata_blob if summary lacked workspace/project
+            if not proj_key:
+                cdb_file = self.conversations_dir / f"{cid}.db"
+                if cdb_file.exists():
+                    ccon = sqlite_safe_connect(cdb_file, readonly=True)
+                    try:
+                        trow = ccon.execute(
+                            "SELECT data FROM trajectory_metadata_blob WHERE id='main'"
+                        ).fetchone()
+                        if trow and trow[0]:
+                            db_tmeta = decode_trajectory_metadata(bytes(trow[0]))
+                            db_ws = str(db_tmeta.get("workspace_uri") or "")
+                            db_pid = str(db_tmeta.get("project_id") or "")
+                            if db_ws:
+                                proj_key = path_dedup_key(db_ws)
+                                proj_path = normalize_path(db_ws)
+                            elif db_pid and db_pid in pid_to_proj:
+                                proj_key, proj_path = pid_to_proj[db_pid]
+                    except Exception:
+                        pass
+                    finally:
+                        ccon.close()
+
+            if proj_key and proj_key in projects_by_key:
+                proj_path = projects_by_key[proj_key].display_path
+
+            needs_repair = False
+            if native_pid == "":
+                needs_repair = True
+            if not raw_s or 28 not in raw_field_nums or not tmb_pid:
+                needs_repair = True
+            if cid not in pb_entries:
+                needs_repair = True
+            if proj_key and proj_key in projects_by_key:
+                exp_agy_pid = projects_by_key[proj_key].primary_id(self.tool_name)
+                if exp_agy_pid and (native_pid != exp_agy_pid or tmb_pid != exp_agy_pid):
+                    needs_repair = True
+                if not wuris_raw:
+                    needs_repair = True
+
             messages = self._read_transcript_messages(cid)
             created_ms = 0
             if not messages:
@@ -1048,9 +1133,42 @@ class AntigravityAdapter(ToolAdapter):
                     is_subagent=is_subagent,
                     parent_id=parent_id,
                     messages=messages,
+                    needs_repair=needs_repair,
                 ).compute_hashes()
             )
         return sessions
+
+    def _ensure_project_registered(
+        self,
+        chat: ChatSession,
+        projects_by_key: dict[str, ProjectItem],
+        created_ms: int,
+        updated_ms: int,
+    ) -> ProjectItem | None:
+        """Ensure chat's project exists in projects_by_key and is registered in Antigravity projects."""
+        pkey = chat.project_key
+        if not pkey and chat.project_path:
+            pkey = path_dedup_key(chat.project_path)
+        if not pkey:
+            return None
+        if pkey not in projects_by_key and chat.project_path:
+            norm_p = normalize_path(chat.project_path)
+            if norm_p:
+                projects_by_key[pkey] = ProjectItem(
+                    canonical_key=pkey,
+                    display_path=norm_p,
+                    name=Path(to_native_path(norm_p)).name or norm_p,
+                    created_at_ms=created_ms,
+                    updated_at_ms=updated_ms,
+                )
+        project = projects_by_key.get(pkey)
+        if project is None:
+            return None
+        if not project.primary_id(self.tool_name):
+            _, updated_projs = self.write_projects(projects_by_key)
+            projects_by_key.update(updated_projs)
+            project = projects_by_key.get(pkey)
+        return project
 
     def write_chat(
         self,
@@ -1063,7 +1181,7 @@ class AntigravityAdapter(ToolAdapter):
         created_ms = chat.created_at_ms or int(time.time() * 1000)
         updated_ms = chat.updated_at_ms or created_ms
 
-        project = projects_by_key.get(chat.project_key) if chat.project_key else None
+        project = self._ensure_project_registered(chat, projects_by_key, created_ms, updated_ms)
         agy_pid = (
             project.primary_id(self.tool_name)
             if (project and project.primary_id(self.tool_name))
@@ -1079,18 +1197,47 @@ class AntigravityAdapter(ToolAdapter):
             chat.title or (filtered_msgs[0].text.splitlines()[0][:80] if filtered_msgs else "Synced Chat")
         ).strip()
 
-        # 1. Write per-conversation SQLite DB with PRAGMA user_version = 1 (required by Antigravity!)
+        # Check if conversations/<cid>.db already exists with matching message content (preserve rich native steps!)
         cdb_path = self.conversations_dir / f"{cid}.db"
+        preserve_existing_steps = False
+        existing_step_count = len(filtered_msgs)
+        last_user_idx = -1
+        last_user_ms = created_ms
+        for idx, msg in enumerate(filtered_msgs):
+            if msg.role == "user":
+                last_user_idx = idx
+                last_user_ms = msg.timestamp_ms or (created_ms + idx * 1000)
+
+        if cdb_path.exists():
+            existing_msgs = self._read_transcript_messages(cid)
+            if not existing_msgs:
+                existing_msgs, _ = self._read_conv_db_messages(cid)
+            if existing_msgs and compute_chat_content_hash("", None, existing_msgs) == compute_chat_content_hash("", None, filtered_msgs):
+                rcon = sqlite_safe_connect(cdb_path, readonly=True)
+                try:
+                    tmrow = rcon.execute("SELECT trajectory_id FROM trajectory_meta LIMIT 1").fetchone()
+                    if tmrow and tmrow[0]:
+                        trajectory_id = str(tmrow[0])
+                    sc_row = rcon.execute("SELECT count(*) FROM steps").fetchone()
+                    if sc_row and int(sc_row[0] or 0) > 0:
+                        existing_step_count = int(sc_row[0])
+                        preserve_existing_steps = True
+                    lu_row = rcon.execute("SELECT MAX(idx) FROM steps WHERE step_type = 14").fetchone()
+                    if lu_row and lu_row[0] is not None:
+                        last_user_idx = int(lu_row[0])
+                except Exception:
+                    preserve_existing_steps = False
+                finally:
+                    rcon.close()
+
+        # 1. Write per-conversation SQLite DB with PRAGMA user_version = 1 (required by Antigravity!)
         conn = sqlite_safe_connect(cdb_path, readonly=False)
+        transcript_lines: list[str] = []
+        user_body_parts: list[str] = [m.text for m in filtered_msgs if m.role == "user"]
+        agent_body_parts: list[str] = [m.text for m in filtered_msgs if m.role != "user"]
         try:
             conn.executescript(_CONV_DB_DDL)
             conn.execute("PRAGMA user_version = 1")
-            conn.execute("DELETE FROM trajectory_meta")
-            conn.execute(
-                "INSERT INTO trajectory_meta(trajectory_id, cascade_id, trajectory_type, source) "
-                "VALUES(?, ?, 4, 1)",
-                (trajectory_id, cid),
-            )
             tmb = encode_trajectory_metadata(
                 cascade_id=cid,
                 created_at_ms=created_ms,
@@ -1101,75 +1248,94 @@ class AntigravityAdapter(ToolAdapter):
                 "INSERT OR REPLACE INTO trajectory_metadata_blob(id, data) VALUES('main', ?)",
                 (tmb,),
             )
-            conn.execute("DELETE FROM steps")
-
-            last_user_idx = -1
-            last_user_ms = created_ms
-            transcript_lines: list[str] = []
-            user_body_parts: list[str] = []
-            agent_body_parts: list[str] = []
-
-            for idx, msg in enumerate(filtered_msgs):
-                mts = msg.timestamp_ms or (created_ms + idx * 1000)
-                turn_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agy-turn:{cid}:{idx}"))
-                if msg.role == "user":
-                    step_type = 14
-                    meta_blob, payload_blob = encode_user_input_step(
-                        text=msg.text,
-                        timestamp_ms=mts,
-                        trajectory_id=trajectory_id,
-                        cascade_id=cid,
-                        step_idx=idx,
-                        turn_uuid=turn_uuid,
-                    )
-                    last_user_idx = idx
-                    last_user_ms = mts
-                    user_body_parts.append(msg.text)
-                    tr_entry = {
-                        "step_index": idx,
-                        "source": "USER_EXPLICIT",
-                        "type": "USER_INPUT",
-                        "status": "DONE",
-                        "created_at": _format_iso_utc(mts),
-                        "content": msg.text,
-                    }
-                else:
-                    step_type = 15
-                    meta_blob, payload_blob = encode_planner_response_step(
-                        text=msg.text,
-                        timestamp_ms=mts,
-                        trajectory_id=trajectory_id,
-                        cascade_id=cid,
-                        step_idx=idx,
-                        turn_uuid=turn_uuid,
-                    )
-                    agent_body_parts.append(msg.text)
-                    tr_entry = {
-                        "step_index": idx,
-                        "source": "MODEL",
-                        "type": "PLANNER_RESPONSE",
-                        "status": "DONE",
-                        "created_at": _format_iso_utc(mts),
-                        "content": msg.text,
-                    }
+            if not preserve_existing_steps:
+                conn.execute("DELETE FROM trajectory_meta")
                 conn.execute(
-                    """
-                    INSERT INTO steps(
-                        idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format
-                    ) VALUES(?, ?, 3, 0, ?, ?, 0)
-                    """,
-                    (idx, step_type, meta_blob, payload_blob),
+                    "INSERT INTO trajectory_meta(trajectory_id, cascade_id, trajectory_type, source) "
+                    "VALUES(?, ?, 4, 1)",
+                    (trajectory_id, cid),
                 )
-                transcript_lines.append(json.dumps(tr_entry, ensure_ascii=False))
+                conn.execute("DELETE FROM steps")
+
+                last_user_idx = -1
+                last_user_ms = created_ms
+                user_body_parts = []
+                agent_body_parts = []
+
+                for idx, msg in enumerate(filtered_msgs):
+                    mts = msg.timestamp_ms or (created_ms + idx * 1000)
+                    turn_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agy-turn:{cid}:{idx}"))
+                    if msg.role == "user":
+                        step_type = 14
+                        meta_blob, payload_blob = encode_user_input_step(
+                            text=msg.text,
+                            timestamp_ms=mts,
+                            trajectory_id=trajectory_id,
+                            cascade_id=cid,
+                            step_idx=idx,
+                            turn_uuid=turn_uuid,
+                        )
+                        last_user_idx = idx
+                        last_user_ms = mts
+                        user_body_parts.append(msg.text)
+                        tr_entry = {
+                            "step_index": idx,
+                            "source": "USER_EXPLICIT",
+                            "type": "USER_INPUT",
+                            "status": "DONE",
+                            "created_at": _format_iso_utc(mts),
+                            "content": msg.text,
+                        }
+                    else:
+                        step_type = 15
+                        meta_blob, payload_blob = encode_planner_response_step(
+                            text=msg.text,
+                            timestamp_ms=mts,
+                            trajectory_id=trajectory_id,
+                            cascade_id=cid,
+                            step_idx=idx,
+                            turn_uuid=turn_uuid,
+                        )
+                        agent_body_parts.append(msg.text)
+                        tr_entry = {
+                            "step_index": idx,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": _format_iso_utc(mts),
+                            "content": msg.text,
+                        }
+                    conn.execute(
+                        """
+                        INSERT INTO steps(
+                            idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format
+                        ) VALUES(?, ?, 3, 0, ?, ?, 0)
+                        """,
+                        (idx, step_type, meta_blob, payload_blob),
+                    )
+                    transcript_lines.append(json.dumps(tr_entry, ensure_ascii=False))
             conn.commit()
         finally:
             conn.close()
 
-        # 2. Write brain transcripts
+        # 2. Write brain transcripts (only when steps were written or transcript missing)
         logs_dir = self.brain_dir / cid / ".system_generated" / "logs"
-        tr_text = ("\n".join(transcript_lines) + "\n") if transcript_lines else ""
-        atomic_write_text(logs_dir / "transcript.jsonl", tr_text)
-        atomic_write_text(logs_dir / "transcript_full.jsonl", tr_text)
+        if not preserve_existing_steps or not (logs_dir / "transcript.jsonl").exists():
+            if not transcript_lines:
+                for idx, msg in enumerate(filtered_msgs):
+                    mts = msg.timestamp_ms or (created_ms + idx * 1000)
+                    tr_entry = {
+                        "step_index": idx,
+                        "source": "USER_EXPLICIT" if msg.role == "user" else "MODEL",
+                        "type": "USER_INPUT" if msg.role == "user" else "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": _format_iso_utc(mts),
+                        "content": msg.text,
+                    }
+                    transcript_lines.append(json.dumps(tr_entry, ensure_ascii=False))
+            tr_text = ("\n".join(transcript_lines) + "\n") if transcript_lines else ""
+            atomic_write_text(logs_dir / "transcript.jsonl", tr_text)
+            atomic_write_text(logs_dir / "transcript_full.jsonl", tr_text)
 
         # 3. Write annotation pbtxt
         escaped_title = title.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
@@ -1179,9 +1345,10 @@ class AntigravityAdapter(ToolAdapter):
         atomic_write_text(self.annotations_dir / f"{cid}.pbtxt", ann_text)
 
         # 4. Encode native raw_summary (field 5 = 1 IDLE, field 16 = last_user_idx, field 28 = 4)
+        final_step_count = existing_step_count if preserve_existing_steps else len(filtered_msgs)
         raw_summary = encode_raw_summary(
             title=title,
-            step_count=len(filtered_msgs),
+            step_count=final_step_count,
             created_at_ms=created_ms,
             last_modified_ms=updated_ms,
             last_user_input_ms=last_user_ms,
@@ -1194,6 +1361,8 @@ class AntigravityAdapter(ToolAdapter):
         )
 
         # 5. Upsert conversation_summaries.db + FTS5
+        ws_label = Path(to_native_path(project.display_path)).name if project else ""
+        proj_label = project.name if project else ""
         sconn = self._ensure_summaries_db()
         try:
             sconn.execute(
@@ -1226,12 +1395,12 @@ class AntigravityAdapter(ToolAdapter):
                     cid,
                     title,
                     title,
-                    len(filtered_msgs),
+                    final_step_count,
                     _format_agy_datetime(updated_ms),
                     ws_uris_json,
                     agy_pid,
                     _format_agy_datetime(last_user_ms),
-                    last_user_idx,
+                    max(0, last_user_idx),
                     raw_summary,
                 ),
             )
@@ -1248,11 +1417,11 @@ class AntigravityAdapter(ToolAdapter):
                 (
                     cid,
                     updated_ms * 1_000_000,
-                    len(filtered_msgs),
+                    final_step_count,
                     updated_ms * 1_000_000,
                     title,
-                    project.display_path if project else "",
-                    project.name if project else "",
+                    ws_label,
+                    proj_label,
                 ),
             )
             if user_body_parts or agent_body_parts:
@@ -1267,7 +1436,7 @@ class AntigravityAdapter(ToolAdapter):
                     """,
                     (
                         cid,
-                        max(0, len(filtered_msgs) - 1),
+                        max(0, final_step_count - 1),
                         "\n\n".join(user_body_parts),
                         "\n\n".join(agent_body_parts),
                     ),
@@ -1308,29 +1477,61 @@ class AntigravityAdapter(ToolAdapter):
                             )
                         )
 
-        # 2. Check agyhub_summaries_proto.pb vs conversation_summaries.db synchronization
+        # 2. Check agyhub_summaries_proto.pb vs conversation_summaries.db synchronization and project binding health
         pb_entries = read_agyhub_summaries_pb(self.hub_summaries_pb)
+        try:
+            projs = self.read_projects()
+        except Exception:
+            projs = {}
         if self.summaries_db.exists():
             conn = sqlite_safe_connect(self.summaries_db, readonly=True)
             conn.row_factory = sqlite3.Row
             try:
                 rows = conn.execute(
-                    "SELECT conversation_id, title, status, raw_summary FROM conversation_summaries"
+                    "SELECT conversation_id, title, status, project_id, workspace_uris, raw_summary FROM conversation_summaries"
                 ).fetchall()
                 missing_from_pb: list[str] = []
                 bad_status_enum: list[str] = []
+                unbound_or_malformed: list[str] = []
                 for r in rows:
                     cid = r["conversation_id"]
                     if cid not in pb_entries:
                         missing_from_pb.append(cid)
                     raw_s = r["raw_summary"]
-                    if raw_s and r["status"] == "CASCADE_RUN_STATUS_IDLE":
+                    pid = (r["project_id"] or "").strip()
+                    wuris_raw = (r["workspace_uris"] or "").strip()
+                    expected_pid_from_ws: str | None = None
+                    if wuris_raw:
                         try:
-                            f5 = first_varint(parse_wire(raw_s), 5)
-                            if f5 != RUN_STATUS_IDLE:
-                                bad_status_enum.append(cid)
+                            wlist = json.loads(wuris_raw)
+                            if isinstance(wlist, list) and wlist:
+                                pk = path_dedup_key(str(wlist[0]))
+                                if pk in projs:
+                                    expected_pid_from_ws = projs[pk].primary_id(self.tool_name)
+                        except Exception:
+                            pass
+                    if not pid or (expected_pid_from_ws and pid != expected_pid_from_ws):
+                        unbound_or_malformed.append(cid)
+                    if raw_s:
+                        try:
+                            rfields = parse_wire(raw_s)
+                            fnums = {fn for fn, _, _ in rfields}
+                            if r["status"] == "CASCADE_RUN_STATUS_IDLE":
+                                f5 = first_varint(rfields, 5)
+                                if f5 != RUN_STATUS_IDLE:
+                                    bad_status_enum.append(cid)
+                            f17 = first_bytes(rfields, 17)
+                            tmb_pid = ""
+                            if f17:
+                                tmb_pid = str(decode_trajectory_metadata(f17).get("project_id") or "")
+                            if 28 not in fnums or not tmb_pid or (pid and tmb_pid != pid):
+                                if cid not in unbound_or_malformed:
+                                    unbound_or_malformed.append(cid)
                         except Exception:
                             bad_status_enum.append(cid)
+                    else:
+                        if cid not in unbound_or_malformed:
+                            unbound_or_malformed.append(cid)
                 if missing_from_pb:
                     issues.append(
                         DoctorIssue(
@@ -1354,6 +1555,20 @@ class AntigravityAdapter(ToolAdapter):
                             path=str(self.summaries_db),
                             message=(
                                 f"{len(bad_status_enum)} idle conversation(s) have raw_summary field 5 != 1 (IDLE)"
+                            ),
+                            fixable=True,
+                        )
+                    )
+                if unbound_or_malformed:
+                    issues.append(
+                        DoctorIssue(
+                            tool=self.tool_name,
+                            severity="error",
+                            code="AGY_UNBOUND_OR_MALFORMED_SUMMARY",
+                            path=str(self.summaries_db),
+                            message=(
+                                f"{len(unbound_or_malformed)} conversation(s) have empty project_id or missing "
+                                "protobuf field 18/28 in raw_summary/trajectory_metadata_blob (invisible in Antigravity UI)"
                             ),
                             fixable=True,
                         )
@@ -1415,37 +1630,87 @@ class AntigravityAdapter(ToolAdapter):
                         cc.close()
 
                 raw_s = r["raw_summary"]
-                needs_raw_fix = False
-                if raw_s and r["status"] == "CASCADE_RUN_STATUS_IDLE":
+                cur_pid = (r["project_id"] or "").strip()
+                wuris_raw = (r["workspace_uris"] or "").strip()
+                ws_uri = ""
+                if wuris_raw:
                     try:
-                        if first_varint(parse_wire(raw_s), 5) != RUN_STATUS_IDLE:
+                        parsed_w = json.loads(wuris_raw)
+                        if isinstance(parsed_w, list) and parsed_w:
+                            ws_uri = str(parsed_w[0])
+                    except Exception:
+                        pass
+
+                # Determine target project_id and workspace_uri
+                target_pid = cur_pid
+                target_ws_uri = ws_uri
+                if target_ws_uri:
+                    pk = path_dedup_key(target_ws_uri)
+                    if pk in projs and projs[pk].primary_id(self.tool_name):
+                        target_pid = str(projs[pk].primary_id(self.tool_name))
+                        target_ws_uri = path_to_file_uri(projs[pk].display_path, encode_drive_colon=True)
+                elif target_pid and target_pid != "outside-of-project":
+                    for p_item in projs.values():
+                        if target_pid in p_item.native_ids_by_tool.get(self.tool_name, []):
+                            target_ws_uri = path_to_file_uri(p_item.display_path, encode_drive_colon=True)
+                            break
+                if not target_pid:
+                    target_pid = "outside-of-project"
+
+                needs_raw_fix = False
+                needs_binding_fix = (cur_pid != target_pid) or (bool(target_ws_uri) and not wuris_raw)
+                if raw_s:
+                    try:
+                        rfields = parse_wire(raw_s)
+                        fnums = {fn for fn, _, _ in rfields}
+                        if r["status"] == "CASCADE_RUN_STATUS_IDLE" and first_varint(rfields, 5) != RUN_STATUS_IDLE:
                             needs_raw_fix = True
+                        f17 = first_bytes(rfields, 17)
+                        tmb_pid = str(decode_trajectory_metadata(f17).get("project_id") or "") if f17 else ""
+                        if 28 not in fnums or tmb_pid != target_pid:
+                            needs_raw_fix = True
+                            needs_binding_fix = True
                     except Exception:
                         needs_raw_fix = True
-                elif not raw_s:
+                else:
                     needs_raw_fix = True
 
                 missing_pb = cid not in pb_entries
-                if not (needs_uv_fix or needs_raw_fix or missing_pb):
+                if not (needs_uv_fix or needs_raw_fix or needs_binding_fix or missing_pb):
                     continue
 
                 if dry_run:
                     result.fixed_count += 1
                     result.details.append(
                         f"Would repair Antigravity chat {cid[:8]} "
-                        f"(uv_fix={needs_uv_fix}, raw_fix={needs_raw_fix}, pb_add={missing_pb})"
+                        f"(uv_fix={needs_uv_fix}, raw_fix={needs_raw_fix}, bind_fix={needs_binding_fix}, pb_add={missing_pb})"
                     )
                     continue
 
-                if needs_uv_fix and cdb.exists():
+                mod_ms = _parse_agy_datetime_ms(str(r["last_modified_time"] or "")) or int(time.time() * 1000)
+                usr_ms = _parse_agy_datetime_ms(str(r["last_user_input_time"] or "")) or mod_ms
+
+                if (needs_uv_fix or needs_binding_fix) and cdb.exists():
                     wc = sqlite_safe_connect(cdb, readonly=False)
                     try:
-                        wc.execute("PRAGMA user_version = 1")
+                        if needs_uv_fix:
+                            wc.execute("PRAGMA user_version = 1")
+                        if needs_binding_fix:
+                            tmb = encode_trajectory_metadata(
+                                cascade_id=cid,
+                                created_at_ms=usr_ms,
+                                workspace_uri=target_ws_uri,
+                                project_id=target_pid,
+                            )
+                            wc.execute(
+                                "INSERT OR REPLACE INTO trajectory_metadata_blob(id, data) VALUES('main', ?)",
+                                (tmb,),
+                            )
                         wc.commit()
                     finally:
                         wc.close()
 
-                if needs_raw_fix:
+                if needs_raw_fix or needs_binding_fix:
                     traj_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agy-traj:{cid}"))
                     if cdb.exists():
                         tc = sqlite_safe_connect(cdb, readonly=True)
@@ -1455,16 +1720,6 @@ class AntigravityAdapter(ToolAdapter):
                                 traj_id = tm[0]
                         finally:
                             tc.close()
-                    ws_uri = ""
-                    if r["workspace_uris"]:
-                        try:
-                            parsed_w = json.loads(r["workspace_uris"])
-                            if isinstance(parsed_w, list) and parsed_w:
-                                ws_uri = str(parsed_w[0])
-                        except Exception:
-                            pass
-                    mod_ms = _parse_agy_datetime_ms(str(r["last_modified_time"] or "")) or int(time.time() * 1000)
-                    usr_ms = _parse_agy_datetime_ms(str(r["last_user_input_time"] or "")) or mod_ms
                     raw_s = encode_raw_summary(
                         title=r["title"] or "",
                         step_count=int(r["step_count"] or 0),
@@ -1473,17 +1728,22 @@ class AntigravityAdapter(ToolAdapter):
                         last_user_input_ms=usr_ms,
                         trajectory_id=traj_id,
                         cascade_id=cid,
-                        workspace_uri=ws_uri,
-                        project_id=r["project_id"] or "outside-of-project",
+                        workspace_uri=target_ws_uri,
+                        project_id=target_pid,
                         last_user_input_step_index=max(0, int(r["last_user_input_step_index"] or 0)),
                         run_status=RUN_STATUS_IDLE,
                     )
+                    target_wuris_json = json.dumps([target_ws_uri], separators=(",", ":")) if target_ws_uri else ""
                     conn.execute(
-                        "UPDATE conversation_summaries SET raw_summary = ? WHERE conversation_id = ?",
-                        (raw_s, cid),
+                        """
+                        UPDATE conversation_summaries
+                        SET project_id = ?, workspace_uris = ?, raw_summary = ?
+                        WHERE conversation_id = ?
+                        """,
+                        (target_pid, target_wuris_json, raw_s, cid),
                     )
 
-                if raw_s and (missing_pb or needs_raw_fix):
+                if raw_s and (missing_pb or needs_raw_fix or needs_binding_fix):
                     pb_updates[cid] = raw_s
                 result.fixed_count += 1
                 result.details.append(f"Repaired Antigravity chat {cid[:8]} and registered in hub summary pb")
@@ -1492,6 +1752,11 @@ class AntigravityAdapter(ToolAdapter):
                 conn.commit()
         finally:
             conn.close()
+
+        if not dry_run:
+            wal_file = Path(f"{self.summaries_db}-wal")
+            if wal_file.exists() and wal_file.stat().st_size > 0:
+                sqlite_wal_checkpoint(self.summaries_db, mode="TRUNCATE")
 
         if pb_updates and not dry_run:
             if self.hub_summaries_pb.exists():

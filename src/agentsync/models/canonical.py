@@ -488,6 +488,7 @@ class ChatSession(BaseModel):
     messages: list[ChatMessage] = Field(default_factory=list)
     fingerprint: str = ""
     content_hash: str = ""
+    needs_repair: bool = False
 
     def compute_hashes(self) -> ChatSession:
         if self.project_path and not self.project_key:

@@ -6,7 +6,7 @@
       <img src="https://img.shields.io/github/actions/workflow/status/saleqss/agentsync/ci.yml?branch=main&label=CI&style=flat-square&logo=github" alt="CI Status" />
     </a>
     <a href="https://github.com/saleqss/agentsync/releases">
-      <img src="https://img.shields.io/badge/version-0.5.0-58a6ff?style=flat-square" alt="Version 0.5.0" />
+      <img src="https://img.shields.io/badge/version-0.5.1-58a6ff?style=flat-square" alt="Version 0.5.1" />
     </a>
     <a href="https://www.python.org/">
       <img src="https://img.shields.io/badge/python-3.11%2B-3fb950?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+" />
@@ -106,7 +106,7 @@ flowchart LR
         TX[WAL-Safe Transactional SQLite<br/>Checkpoint + Integrity Check + Rollback]
     end
 
-    subgraph Core["AgentSync v0.5.0 Core"]
+    subgraph Core["AgentSync v0.5.1 Core"]
         CAN[Canonical Hub<br/>Skills / MCP / Rules / Projects / Chats]
         REP[Auto-Diagnostics &amp; Self-Healing<br/>Rollouts + DB Recovery + repair --on-close]
         HO[Session Handoff Engine<br/>DB Verification + Hash Dedupe]

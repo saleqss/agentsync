@@ -4,6 +4,21 @@ All notable changes to **AgentSync** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-23
+
+### Fixed
+- **Antigravity -> Codex Project Binding & Unified Sidebar Visibility:**
+  - Fixed URI/Windows/Cyrillic path canonicalization (`file:///c%3A/...`, `%D0%A1...`, `/C:/...`, `win32:/mnt/c/...`, and extended `\\?\C:\...` prefixes) to resolve exact on-disk casing with uppercase drive letters and native backslashes.
+  - Updated `CodexAdapter.write_projects()` and `write_chat()` to register all workspace IDs in `.codex-global-state.json -> electron-persisted-atom-state["unified-sidebar-project-order-v1"]` (`"codex:project:<legacy_id>"`), `state_5.sqlite` (`threads.project_id` + `threads.cwd`), `sqlite/codex.db` (`local_thread_catalog.project_id`, `thread_source = 'user'`, and `catalog_revision`), and `thread-project-assignments` while removing bound threads from `projectless-thread-ids`.
+  - Added lossless in-place project re-binding (`preserve_existing_rollout`) so re-binding existing or native Codex threads updates SQLite and global-state project bindings without overwriting rich native rollout items (`world_state`, `additional_tools`, `tokens_used`, or `git_sha`).
+  - Added `CODEX_UNBOUND_SYNCED_THREAD` to `CodexAdapter.doctor()` and `repair()` (and `SAFE_AUTO_HEAL_CODES` for `repair --on-close`) to re-bind previously synced unbound threads in place without duplicating chats.
+- **Full Bidirectional Chat Transfer & Visibility in Google Antigravity (`Codex -> Antigravity`):**
+  - Fixed a critical protobuf serialization bug in `encode_trajectory_metadata()` (`proto_wire.py`) where `project_id = "outside-of-project"` was omitted from wire field 18 (`trajectory_metadata_blob`), which caused Antigravity's Go language server to overwrite `conversation_summaries.project_id` to `""` (empty string) and hide general/non-project Codex chats in the Antigravity UI.
+  - Updated `AntigravityAdapter.read_chats()` to fall back to `raw_summary` (wire fields 9 and 17), `conversations/<cid>.db -> trajectory_metadata_blob`, and `projects/*.json` when `workspace_uris` or `project_id` columns are empty.
+  - Updated `AntigravityAdapter.write_chat()` to auto-register missing project directories, preserve rich native `steps` / `gen_metadata` / `executor_metadata` when re-binding existing conversations, write native folder basename `workspace` labels in `conversations_fts`, and checkpoint `conversation_summaries.db` WAL cleanly.
+  - Added `AGY_UNBOUND_OR_MALFORMED_SUMMARY` to `AntigravityAdapter.doctor()` and `repair()` to heal conversations with empty `project_id = ""` or missing protobuf wire fields 18 and 28.
+  - Updated `SyncEngine._sync_chats()` to propagate project bindings across tools and heal `needs_repair` sessions even when message text hashes match, while maintaining strict 0-diff idempotency on runs 2 and 3.
+
 ## [0.5.0] - 2026-11-23
 
 ### Fixed

@@ -170,8 +170,8 @@ def encode_trajectory_metadata(
     parts.append(field_str(6, cascade_id))
     if workspace_uri:
         parts.append(field_str(7, workspace_uri))
-    if project_id and project_id != "outside-of-project":
-        parts.append(field_str(18, project_id))
+    effective_pid = project_id or "outside-of-project"
+    parts.append(field_str(18, effective_pid))
     return b"".join(parts)
 
 
